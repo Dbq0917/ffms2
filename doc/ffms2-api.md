@@ -883,6 +883,67 @@ void FFMS_FreeIndexBuffer(uint8_t **BufferPtr)
 
 Frees the buffer pointed to by `BufferPtr` and sets it to NULL.
 
+### FFMS_GetIndexForFile - shared, reusable index with safe storage handling
+
+[GetIndexForFile]: #ffms_getindexforfile---shared-reusable-index-with-safe-storage-handling
+```c++
+typedef struct FFMS_IndexStorage {
+    const char *LocalCacheDir;  /* Optional local directory for read-only source dirs */
+    int LockWaitMs;             /* 0 = non-blocking, negative = default (30000 ms) */
+    void *Reserved[4];          /* Must be zeroed */
+} FFMS_IndexStorage;
+
+FFMS_Index *FFMS_GetIndexForFile(const char *SourceFile,
+                                 const FFMS_IndexStorage *Storage,
+                                 FFMS_ErrorInfo *ErrorInfo);
+```
+
+One-call index acquisition designed for services that open the same large
+files from many worker processes. It encapsulates the whole
+read-validate-build-publish cycle:
+
+1. Looks for a valid index next to the source under a versioned file name
+   (`<source>.ffms2-v<ffms2version>-idx<indexversion>`), and additionally the
+   legacy `<source>.ffindex` name so existing deployments keep working.
+2. If none is usable, looks in `LocalCacheDir` (indexes there are keyed by a
+   hash of the absolute source path).
+3. If still nothing, builds a fresh index. The build is a plain demux scan,
+   exactly like [FFMS_DoIndexing2][DoIndexing2], so first-index time does not
+   change.
+4. Publishes the new index with a write-temp-and-atomic-rename into the source
+   directory when writable, otherwise into `LocalCacheDir`. If neither is
+   writable, the index is returned in memory only and rebuilt on the next
+   process.
+
+Properties that matter in production:
+
+- An index file is written once and never appended to. Repeatedly opening the
+  same source cannot grow it, which eliminates the multi-GB startup problem.
+- The file name embeds both the FFMS2 version and the on-disk index format
+  version, so two incompatible builds deployed on one machine use separate
+  files and can never overwrite or corrupt each other's output.
+- An advisory lock (`flock` on POSIX, `LockFileEx` on Windows) serializes
+  builds across processes; concurrent readers keep using the old file until
+  the new one is renamed into place. File systems without lock support simply
+  skip locking; the atomic publish remains safe.
+- Corrupt, truncated, or signature-mismatched index files are ignored and
+  rebuilt transparently instead of failing the open.
+
+The returned index must be destroyed with `FFMS_DestroyIndex`.
+
+### FFMS_GetIndexFileName - versioned index file name for a source
+
+[GetIndexFileName]: #ffms_getindexfilename---versioned-index-file-name-for-a-source
+```c++
+char *FFMS_GetIndexFileName(const char *SourceFile);
+void FFMS_FreeString(char *String);
+```
+
+Returns the versioned sidecar file name that `FFMS_GetIndexForFile` would use
+for `SourceFile`. Useful for monitoring, pre-warming, or cleanup tooling.
+The returned string is heap allocated and must be released with
+`FFMS_FreeString`.
+
 ### FFMS_GetPixFmt - gets a colorspace identifier from a colorspace name
 
 [GetPixFmt]: #ffms_getpixfmt---gets-a-colorspace-identifier-from-a-colorspace-name
@@ -1198,11 +1259,20 @@ Explanation of the values:
  - `FFMS_SEEK_LINEAR` - Linear access (i.e. if you request frame `n` without having requested frames 0 to `n-1` in order first, all frames from 0 to `n` will have to be decoded before `n` can be delivered).
    The definition of slow, but should make some formats "usable".
  - `FFMS_SEEK_NORMAL` - Safe normal.
-   Bases seeking decisions on the keyframe positions reported by libavformat.
+  Bases seeking decisions on the keyframe positions in the index and then
+  decodes forward from the preceding keyframe until the requested frame is
+  reached. This mode is frame accurate: `FFMS_GetFrame` always returns exactly
+  the requested frame number, even when the GOP is minutes long. The keyframe
+  is only the decode starting point, never the returned frame.
  - `FFMS_SEEK_UNSAFE` - Unsafe normal.
-   Same as `FFMS_SEEK_NORMAL` but no error will be thrown if the exact destination has to be guessed.
+  Same keyframe-plus-forward-decode (and therefore frame accurate) behavior as
+  `FFMS_SEEK_NORMAL`, but no error is thrown if the exact destination has to be
+  guessed near a timestamp discontinuity.
  - `FFMS_SEEK_AGGRESSIVE` - Aggressive.
    Seeks in the forward direction even if no closer keyframe is known to exist.
+  Because avformat is allowed to land on non-keyframe packets, the decoder can
+  overshoot the requested frame. This mode is NOT frame accurate on every file
+  and must not be used when exact frame numbers are required.
    Only useful for testing and containers where libavformat doesn't report keyframes properly.
 
 ### FFMS_IndexErrorHandling

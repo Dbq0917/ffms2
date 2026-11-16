@@ -24,9 +24,14 @@ src_core_libffms2_la_LIBADD = @FFMPEG_LIBS@ @ZLIB_LDFLAGS@ -lz @LTUNDEF@
 src_core_libffms2_la_SOURCES = \
 	src/core/audiosource.cpp \
 	src/core/audiosource.h \
+	src/core/filelock.cpp \
+	src/core/filelock.h \
 	src/core/ffms.cpp \
 	src/core/filehandle.cpp \
 	src/core/filehandle.h \
+	src/core/indexservice.cpp \
+	src/core/indexstore.cpp \
+	src/core/indexstore.h \
 	src/core/indexing.cpp \
 	src/core/indexing.h \
 	src/core/track.cpp \

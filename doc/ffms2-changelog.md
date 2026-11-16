@@ -1,4 +1,15 @@
 # FFmpegSource2 Changelog
+- Unreleased
+  - Added FFMS_GetIndexForFile for shared, reusable index handling across many
+    worker processes: versioned sidecar file names, atomic write-then-rename
+    publishing, advisory cross-process build locking, transparent rebuild on
+    corrupt/mismatched indexes, and a local cache fallback for read-only
+    source directories.
+  - Added FFMS_GetIndexFileName/FFMS_FreeString.
+  - Documented that FFMS_SEEK_NORMAL and FFMS_SEEK_UNSAFE are frame accurate
+    (keyframe seek plus forward decode), while FFMS_SEEK_AGGRESSIVE is not
+    guaranteed frame accurate.
+
 - 5.1
   - FFmpeg 7.1 is now the minimum requirement.
   - Added layered decoding support, for e.g. spatial MV-HEVC.

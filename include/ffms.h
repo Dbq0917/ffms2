@@ -139,6 +139,29 @@ typedef enum FFMS_SeekMode {
     FFMS_SEEK_AGGRESSIVE = 3
 } FFMS_SeekMode;
 
+/*
+ * Seek mode semantics (important for frame accurate extraction):
+ *
+ * FFMS_SEEK_NORMAL (1) is frame accurate. FFMS_GetFrame() seeks to the
+ * closest preceding keyframe reported by the index and then decodes forward
+ * until the requested frame number is reached. The returned frame is always
+ * exactly the requested one, even with very long GOPs; the index only tells
+ * the decoder where to start, it is never returned as the result.
+ *
+ * FFMS_SEEK_UNSAFE (2) uses the same keyframe-plus-forward-decode path and is
+ * also frame accurate, it simply skips a safety margin around timestamp
+ * discontinuities.
+ *
+ * FFMS_SEEK_AGGRESSIVE (3) allows avformat to seek to non-keyframe packets.
+ * It can overshoot the requested frame and therefore is NOT frame accurate
+ * on every file. Do not use it when exact frame numbers matter.
+ *
+ * If a wrapper appears to "return the keyframe" instead of the requested
+ * frame, it is almost certainly seeking with FFMS_SEEK_AGGRESSIVE or mapping
+ * timestamps to keyframe numbers itself. Switch it to FFMS_SEEK_NORMAL and
+ * request frames by number via FFMS_GetFrame.
+ */
+
 typedef enum FFMS_IndexErrorHandling {
     FFMS_IEH_ABORT = 0,
     FFMS_IEH_CLEAR_TRACK = 1,
@@ -485,4 +508,45 @@ FFMS_API(int) FFMS_WriteIndex(const char *IndexFile, FFMS_Index *Index, FFMS_Err
 FFMS_API(int) FFMS_WriteIndexToBuffer(uint8_t **BufferPtr, size_t *Size, FFMS_Index *Index, FFMS_ErrorInfo *ErrorInfo);
 FFMS_API(void) FFMS_FreeIndexBuffer(uint8_t **BufferPtr);
 FFMS_API(int) FFMS_GetPixFmt(const char *Name);
+
+/*
+ * Shared, reusable index storage for services that open the same files from
+ * many worker processes. Pass an initialized FFMS_IndexStorage to
+ * FFMS_GetIndexForFile:
+ *
+ *  - The index is written once and published atomically, so repeated opens
+ *    reuse it instead of appending to it and growing the .ffindex file.
+ *  - The file name carries the ffms2 and index format versions, so two
+ *    incompatible builds never overwrite each other's index.
+ *  - An advisory lock serializes (re)building across processes; concurrent
+ *    readers keep using the old file until the new one is renamed into place.
+ *  - If the source directory is not writable, LocalCacheDir is used instead.
+ *    When LocalCacheDir is NULL too, the index is rebuilt in memory only.
+ */
+typedef struct FFMS_IndexStorage {
+    const char *LocalCacheDir;  /* Optional local directory for read-only source dirs */
+    int LockWaitMs;             /* 0 = non-blocking, negative = default (30000 ms) */
+    void *Reserved[4];          /* Must be zeroed; reserved for future options */
+} FFMS_IndexStorage;
+
+/*
+ * Returns a ready-to-use index for SourceFile.
+ *
+ * Tries the versioned sidecar index next to the source first, then the local
+ * cache directory, and finally builds a fresh index (demux scan only, exactly
+ * like FFMS_DoIndexing2 - the first-index cost does not change). A fresh
+ * index is published atomically when a writable location exists.
+ *
+ * Corrupt or mismatched index files are ignored and rebuilt transparently.
+ * The returned index must be destroyed with FFMS_DestroyIndex.
+ */
+FFMS_API(FFMS_Index *) FFMS_GetIndexForFile(const char *SourceFile,
+                                            const FFMS_IndexStorage *Storage,
+                                            FFMS_ErrorInfo *ErrorInfo);
+
+/* Returns the versioned index file name that would be used next to SourceFile. */
+FFMS_API(char *) FFMS_GetIndexFileName(const char *SourceFile);
+
+/* Frees a string returned by this API (currently just wraps free). */
+FFMS_API(void) FFMS_FreeString(char *String);
 #endif
