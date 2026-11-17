@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <random>
@@ -54,6 +55,15 @@ protected:
 
     std::string SamplesDir;
 };
+
+int FFMS_CC CancelLateInIndexing(int64_t Current, int64_t Total, void *Private) {
+    bool *Cancelled = static_cast<bool *>(Private);
+    if (!*Cancelled && Total > 0 && Current * 100 / Total >= 40) {
+        *Cancelled = true;
+        return 1;
+    }
+    return 0;
+}
 
 void IndexerTest::SetUp() {
     indexer = nullptr;
@@ -152,6 +162,67 @@ TEST_P(IndexerTest, RandomAccessingFrame) {
 }
 
 INSTANTIATE_TEST_CASE_P(ValidateIndexer, IndexerTest, ::testing::ValuesIn(TestFiles));
+
+TEST(IndexerRobust, CheckpointResumeAndOutputDuration) {
+    const std::string FilePath = std::string(STRINGIFY(SAMPLES_DIR)) + "/test.mp4";
+    const std::string CheckpointFile = FilePath + ".ffms2-robust-test.checkpoint.txt";
+    const std::string ReportFile = CheckpointFile + ".report.txt";
+    std::remove(CheckpointFile.c_str());
+    std::remove(ReportFile.c_str());
+
+    char ErrorMsg[1024] = {};
+    FFMS_ErrorInfo E = {};
+    E.Buffer = ErrorMsg;
+    E.BufferSize = sizeof(ErrorMsg);
+
+    FFMS_RobustOptions Options = {};
+    Options.EnableStallDetection = 1;
+    Options.StallTimeoutMs = 5000;
+    Options.EnableCheckpoint = 1;
+    Options.CheckpointIntervalMs = 1000;
+    Options.CheckpointFile = CheckpointFile.c_str();
+    Options.ReportFile = ReportFile.c_str();
+
+    FFMS_Init(0, 0);
+
+    FFMS_Indexer *Indexer = FFMS_CreateIndexerWithOptions(FilePath.c_str(), nullptr, 0, &Options, &E);
+    ASSERT_NE(nullptr, Indexer) << ErrorMsg;
+    bool Cancelled = false;
+    FFMS_SetProgressCallback(Indexer, CancelLateInIndexing, &Cancelled);
+    FFMS_Index *Index = FFMS_DoIndexing2(Indexer, FFMS_IEH_CLEAR_TRACK, &E);
+    ASSERT_EQ(nullptr, Index);
+    ASSERT_TRUE(Cancelled);
+
+    FFMS_CheckpointInfo Info = {};
+    ASSERT_EQ(FFMS_ERROR_SUCCESS, FFMS_ReadCheckpoint(CheckpointFile.c_str(), &Info, &E)) << ErrorMsg;
+    ASSERT_EQ(FFMS_CHECKPOINT_CANCELLED, Info.Status);
+    ASSERT_GE(Info.LastFrame, 0);
+    const int64_t CancelledFrame = Info.LastFrame;
+
+    Indexer = FFMS_CreateIndexerWithOptions(FilePath.c_str(), nullptr, 0, &Options, &E);
+    ASSERT_NE(nullptr, Indexer) << ErrorMsg;
+    Index = FFMS_DoIndexing2(Indexer, FFMS_IEH_CLEAR_TRACK, &E);
+    ASSERT_NE(nullptr, Index) << ErrorMsg;
+
+    ASSERT_EQ(FFMS_ERROR_SUCCESS, FFMS_ReadCheckpoint(CheckpointFile.c_str(), &Info, &E)) << ErrorMsg;
+    ASSERT_EQ(FFMS_CHECKPOINT_COMPLETED, Info.Status);
+    ASSERT_GT(Info.LastFrame, CancelledFrame);
+
+    int VideoTrack = FFMS_GetFirstIndexedTrackOfType(Index, FFMS_TYPE_VIDEO, &E);
+    ASSERT_GE(VideoTrack, 0) << ErrorMsg;
+    FFMS_VideoSource *Video = FFMS_CreateVideoSourceWithOptions(FilePath.c_str(), VideoTrack,
+        Index, 1, FFMS_SEEK_NORMAL, &Options, &E);
+    ASSERT_NE(nullptr, Video) << ErrorMsg;
+    const int Frames = FFMS_GetNumFrames(FFMS_GetTrackFromVideo(Video));
+    for (int Frame = 0; Frame < Frames; ++Frame)
+        ASSERT_NE(nullptr, FFMS_GetFrame(Video, Frame, &E)) << "frame " << Frame << ": " << ErrorMsg;
+    ASSERT_GT(FFMS_GetVideoProperties(Video)->LastEndTime, 0.0);
+
+    FFMS_DestroyVideoSource(Video);
+    FFMS_DestroyIndex(Index);
+    std::remove(CheckpointFile.c_str());
+    std::remove(ReportFile.c_str());
+}
 
 } //namespace
 

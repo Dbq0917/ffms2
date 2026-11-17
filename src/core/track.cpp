@@ -28,6 +28,8 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <ostream>
+#include <sstream>
 
 extern "C" {
 #include <libavutil/avutil.h>
@@ -130,6 +132,131 @@ void FFMS_Track::Write(ZipFile &stream) const {
     FrameInfo temp{};
     for (size_t i = 0; i < size(); ++i)
         WriteFrame(stream, Frames[i], i == 0 ? temp : Frames[i - 1], TT);
+}
+
+void FFMS_Track::WriteCheckpoint(std::ostream &Stream) const {
+    frame_vec &Frames = Data->Frames;
+    Stream << "tt=" << static_cast<int>(TT) << "\n"
+           << "tb_num=" << TB.Num << "\n"
+           << "tb_den=" << TB.Den << "\n"
+           << "last_duration=" << LastDuration << "\n"
+           << "max_b_frames=" << MaxBFrames << "\n"
+           << "use_dts=" << (UseDTS ? 1 : 0) << "\n"
+           << "has_ts=" << (HasTS ? 1 : 0) << "\n"
+           << "has_discont_ts=" << (HasDiscontTS ? 1 : 0) << "\n"
+           << "sample_rate=" << SampleRate << "\n"
+           << "frame_count=" << size() << "\n";
+
+    for (size_t i = 0; i < size(); ++i) {
+        const FrameInfo &F = Frames[i];
+        Stream << "frame=" << F.PTS
+               << ',' << F.OriginalPTS
+               << ',' << F.DTS
+               << ',' << F.FilePos
+               << ',' << F.SampleStart
+               << ',' << F.SampleCount
+               << ',' << F.OriginalPos
+               << ',' << F.PosInDecodingOrder
+               << ',' << F.FrameType
+               << ',' << F.RepeatPict
+               << ',' << (F.KeyFrame ? 1 : 0)
+               << ',' << (F.MarkedHidden ? 1 : 0)
+               << ',' << (F.SecondField ? 1 : 0)
+               << '\n';
+    }
+}
+
+bool FFMS_Track::ReadCheckpoint(const std::string &Section, bool Finalized, std::string &Error) {
+    frame_vec Frames;
+    size_t ExpectedFrames = 0;
+    bool HasFrameCount = false;
+    std::istringstream In(Section);
+    std::string Line;
+
+    while (std::getline(In, Line)) {
+        if (!Line.empty() && Line[Line.size() - 1] == '\r')
+            Line.pop_back();
+        if (Line.empty())
+            continue;
+
+        size_t Eq = Line.find('=');
+        if (Eq == std::string::npos) {
+            Error = "malformed track checkpoint line: " + Line;
+            return false;
+        }
+        std::string Key = Line.substr(0, Eq);
+        std::string Value = Line.substr(Eq + 1);
+
+        if (Key == "tt") {
+            TT = static_cast<FFMS_TrackType>(std::atoi(Value.c_str()));
+        } else if (Key == "tb_num") {
+            TB.Num = std::strtoll(Value.c_str(), nullptr, 10);
+        } else if (Key == "tb_den") {
+            TB.Den = std::strtoll(Value.c_str(), nullptr, 10);
+        } else if (Key == "last_duration") {
+            LastDuration = std::strtoll(Value.c_str(), nullptr, 10);
+        } else if (Key == "max_b_frames") {
+            MaxBFrames = std::atoi(Value.c_str());
+        } else if (Key == "use_dts") {
+            UseDTS = std::atoi(Value.c_str()) != 0;
+        } else if (Key == "has_ts") {
+            HasTS = std::atoi(Value.c_str()) != 0;
+        } else if (Key == "has_discont_ts") {
+            HasDiscontTS = std::atoi(Value.c_str()) != 0;
+        } else if (Key == "sample_rate") {
+            SampleRate = std::atoi(Value.c_str());
+        } else if (Key == "frame_count") {
+            ExpectedFrames = static_cast<size_t>(std::strtoull(Value.c_str(), nullptr, 10));
+            HasFrameCount = true;
+            Frames.reserve(ExpectedFrames);
+        } else if (Key == "frame") {
+            std::vector<std::string> Fields;
+            std::ostringstream Current;
+            for (size_t i = 0; i < Value.size(); ++i) {
+                if (Value[i] == ',') {
+                    Fields.push_back(Current.str());
+                    Current.str("");
+                    Current.clear();
+                } else {
+                    Current << Value[i];
+                }
+            }
+            Fields.push_back(Current.str());
+
+            if (Fields.size() != 13) {
+                Error = "malformed frame checkpoint record";
+                return false;
+            }
+
+            FrameInfo F = {};
+            F.PTS = std::strtoll(Fields[0].c_str(), nullptr, 10);
+            F.OriginalPTS = std::strtoll(Fields[1].c_str(), nullptr, 10);
+            F.DTS = std::strtoll(Fields[2].c_str(), nullptr, 10);
+            F.FilePos = std::strtoll(Fields[3].c_str(), nullptr, 10);
+            F.SampleStart = std::strtoll(Fields[4].c_str(), nullptr, 10);
+            F.SampleCount = static_cast<uint32_t>(std::strtoul(Fields[5].c_str(), nullptr, 10));
+            F.OriginalPos = static_cast<size_t>(std::strtoull(Fields[6].c_str(), nullptr, 10));
+            F.PosInDecodingOrder = static_cast<size_t>(std::strtoull(Fields[7].c_str(), nullptr, 10));
+            F.FrameType = std::atoi(Fields[8].c_str());
+            F.RepeatPict = std::atoi(Fields[9].c_str());
+            F.KeyFrame = std::atoi(Fields[10].c_str()) != 0;
+            F.MarkedHidden = std::atoi(Fields[11].c_str()) != 0;
+            F.SecondField = std::atoi(Fields[12].c_str()) != 0;
+            Frames.push_back(F);
+        }
+    }
+
+    if (!HasFrameCount || Frames.size() != ExpectedFrames) {
+        Error = "track checkpoint has a missing or inconsistent frame count";
+        return false;
+    }
+
+    Data->Frames.swap(Frames);
+    Data->RealFrameNumbers.clear();
+    Data->PublicFrameInfo.clear();
+    if (Finalized)
+        GeneratePublicInfo();
+    return true;
 }
 
 void FFMS_Track::AddVideoFrame(int64_t PTS, int64_t DTS, int RepeatPict, bool KeyFrame, int FrameType, int64_t FilePos, bool MarkedHidden, bool SecondField) {

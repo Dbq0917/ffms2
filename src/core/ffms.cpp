@@ -22,6 +22,7 @@
 
 #include "audiosource.h"
 #include "indexing.h"
+#include "robust.h"
 #include "videosource.h"
 #include "videoutils.h"
 
@@ -33,6 +34,9 @@ extern "C" {
 #include <mutex>
 #include <sstream>
 #include <iomanip>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef FFMS_WIN_DEBUG
 #	include <windows.h>
@@ -100,8 +104,12 @@ FFMS_API(void) FFMS_SetLogLevel(int Level) {
 }
 
 FFMS_API(FFMS_VideoSource *) FFMS_CreateVideoSource(const char *SourceFile, int Track, FFMS_Index *Index, int Threads, int SeekMode, FFMS_ErrorInfo *ErrorInfo) {
+    return FFMS_CreateVideoSourceWithOptions(SourceFile, Track, Index, Threads, SeekMode, nullptr, ErrorInfo);
+}
+
+FFMS_API(FFMS_VideoSource *) FFMS_CreateVideoSourceWithOptions(const char *SourceFile, int Track, FFMS_Index *Index, int Threads, int SeekMode, const FFMS_RobustOptions *Options, FFMS_ErrorInfo *ErrorInfo) {
     try {
-        return new FFMS_VideoSource(SourceFile, *Index, Track, Threads, SeekMode);
+        return new FFMS_VideoSource(SourceFile, *Index, Track, Threads, SeekMode, Options);
     } catch (FFMS_Exception &e) {
         e.CopyOut(ErrorInfo);
         return nullptr;
@@ -113,8 +121,12 @@ FFMS_API(FFMS_AudioSource *) FFMS_CreateAudioSource(const char *SourceFile, int 
 }
 
 FFMS_API(FFMS_AudioSource *) FFMS_CreateAudioSource2(const char *SourceFile, int Track, FFMS_Index *Index, int DelayMode, int FillGaps, double DrcScale, FFMS_ErrorInfo *ErrorInfo) {
+    return FFMS_CreateAudioSourceWithOptions(SourceFile, Track, Index, DelayMode, FillGaps, DrcScale, nullptr, ErrorInfo);
+}
+
+FFMS_API(FFMS_AudioSource *) FFMS_CreateAudioSourceWithOptions(const char *SourceFile, int Track, FFMS_Index *Index, int DelayMode, int FillGaps, double DrcScale, const FFMS_RobustOptions *Options, FFMS_ErrorInfo *ErrorInfo) {
     try {
-        return new FFMS_AudioSource(SourceFile, *Index, Track, DelayMode, FillGaps, DrcScale);
+        return new FFMS_AudioSource(SourceFile, *Index, Track, DelayMode, FillGaps, DrcScale, Options);
     } catch (FFMS_Exception &e) {
         e.CopyOut(ErrorInfo);
         return nullptr;
@@ -313,9 +325,13 @@ FFMS_API(FFMS_Indexer *) FFMS_CreateIndexer(const char *SourceFile, FFMS_ErrorIn
 }
 
 FFMS_API(FFMS_Indexer *) FFMS_CreateIndexer2(const char *SourceFile, const FFMS_KeyValuePair *DemuxerOptions, int NumOptions, FFMS_ErrorInfo *ErrorInfo) {
+    return FFMS_CreateIndexerWithOptions(SourceFile, DemuxerOptions, NumOptions, nullptr, ErrorInfo);
+}
+
+FFMS_API(FFMS_Indexer *) FFMS_CreateIndexerWithOptions(const char *SourceFile, const FFMS_KeyValuePair *DemuxerOptions, int NumOptions, const FFMS_RobustOptions *Options, FFMS_ErrorInfo *ErrorInfo) {
     ClearErrorInfo(ErrorInfo);
     try {
-        return new FFMS_Indexer(SourceFile, DemuxerOptions, NumOptions);
+        return new FFMS_Indexer(SourceFile, DemuxerOptions, NumOptions, Options);
     } catch (FFMS_Exception &e) {
         e.CopyOut(ErrorInfo);
         return nullptr;
@@ -418,6 +434,49 @@ FFMS_API(void) FFMS_FreeIndexBuffer(uint8_t **BufferPtr) {
 
 FFMS_API(int) FFMS_GetPixFmt(const char *Name) {
     return av_get_pix_fmt(Name);
+}
+
+FFMS_API(int) FFMS_ReadCheckpoint(const char *CheckpointFile, FFMS_CheckpointInfo *Info, FFMS_ErrorInfo *ErrorInfo) {
+    ClearErrorInfo(ErrorInfo);
+    if (!CheckpointFile || !Info) {
+        if (ErrorInfo && ErrorInfo->BufferSize > 0) {
+            ErrorInfo->ErrorType = FFMS_ERROR_CHECKPOINT;
+            ErrorInfo->SubType = FFMS_ERROR_INVALID_ARGUMENT;
+            std::snprintf(ErrorInfo->Buffer, ErrorInfo->BufferSize,
+                "CheckpointFile and Info must not be null");
+        }
+        return (FFMS_ERROR_CHECKPOINT << 16) | FFMS_ERROR_INVALID_ARGUMENT;
+    }
+
+    robust::CheckpointRecord Record;
+    std::string Error;
+    if (!robust::ReadCheckpoint(CheckpointFile, Record, &Error)) {
+        if (ErrorInfo && ErrorInfo->BufferSize > 0) {
+            ErrorInfo->ErrorType = FFMS_ERROR_CHECKPOINT;
+            ErrorInfo->SubType = FFMS_ERROR_FILE_READ;
+            std::snprintf(ErrorInfo->Buffer, ErrorInfo->BufferSize, "%s", Error.c_str());
+        }
+        return (FFMS_ERROR_CHECKPOINT << 16) | FFMS_ERROR_FILE_READ;
+    }
+
+    std::memset(Info, 0, sizeof(*Info));
+    robust::FillPublicCheckpointInfo(Record, Info);
+    return FFMS_ERROR_SUCCESS;
+}
+
+FFMS_API(char *) FFMS_GetCheckpointFileName(const char *SourceFile, int Kind) {
+    if (!SourceFile)
+        return nullptr;
+    std::string Name = robust::DefaultCheckpointPath(SourceFile, Kind);
+    char *Out = static_cast<char *>(std::malloc(Name.size() + 1));
+    if (!Out)
+        return nullptr;
+    std::memcpy(Out, Name.c_str(), Name.size() + 1);
+    return Out;
+}
+
+FFMS_API(void) FFMS_FreeString(char *String) {
+    std::free(String);
 }
 
 FFMS_API(const char *) FFMS_GetFormatNameI(FFMS_Indexer *Indexer) {

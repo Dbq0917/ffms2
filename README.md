@@ -6,6 +6,19 @@ The library is written in C++, but the public API is pure C, so if you can link 
 
 For more information on using the library, see the [API documentation](doc/ffms2-api.md) and the [changelog](doc/ffms2-changelog.md).
 
+### Long-running and remote inputs
+
+`ffmsindex` and the opt-in `FFMS_*WithOptions` APIs can detect a job that has
+stopped making progress, report the exact phase/frame/timestamp/byte position,
+and resume an interrupted index scan from a human-readable text checkpoint.
+The legacy APIs keep their original behavior. See the
+[robust long-running jobs](doc/ffms2-api.md#robust-long-running-jobs-stall-reports-and-checkpoints)
+section for the API and checkpoint format, or run `ffmsindex` without arguments
+for the new `--checkpoint`, `--stall-timeout`, `--report`, and per-job disable
+options (`--no-checkpoint`, `--no-stall-detection`). The `ffmsindex` command
+enables both protections by default; library callers opt in through the new
+constructors, so existing library clients keep the old zero-overhead path.
+
 ### Avisynth and VapourSynth plugin
 For the end user, the most visible use of FFMS is the implementation of both an [Avisynth](http://avisynth.nl) and a [VapourSynth](http://www.vapoursynth.com) source plugin that uses the FFMS library to open media files. This plugin is a part of the FFMS2 project and is available for download here; for documentation see the [Avisynth user guide](doc/ffms2-avisynth.md).
 

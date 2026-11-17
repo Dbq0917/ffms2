@@ -28,7 +28,7 @@ extern "C" {
 #include <libavformat/avio.h>
 }
 
-static AVIOContext *ffms_fopen(const char *filename, const char *mode) {
+static AVIOContext *ffms_fopen(const char *filename, const char *mode, const AVIOInterruptCB *InterruptCallback) {
     int flags = 0;
     if (strchr(mode, 'r'))
         flags |= AVIO_FLAG_READ;
@@ -36,14 +36,15 @@ static AVIOContext *ffms_fopen(const char *filename, const char *mode) {
         flags |= AVIO_FLAG_WRITE;
 
     AVIOContext *ctx;
-    int ret = avio_open2(&ctx, filename, flags, nullptr, nullptr);
+    int ret = avio_open2(&ctx, filename, flags, InterruptCallback, nullptr);
     if (ret < 0)
         return nullptr;
     return ctx;
 }
 
-FileHandle::FileHandle(const char *filename, const char *mode, int error_source, int error_cause)
-    : avio(ffms_fopen(filename, mode))
+FileHandle::FileHandle(const char *filename, const char *mode, int error_source, int error_cause,
+    const AVIOInterruptCB *InterruptCallback)
+    : avio(ffms_fopen(filename, mode, InterruptCallback))
     , filename(filename)
     , error_source(error_source)
     , error_cause(error_cause) {

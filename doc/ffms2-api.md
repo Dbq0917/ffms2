@@ -1405,6 +1405,106 @@ b: FF_BI_TYPE (no good explanation available)
 ?: Unknown
 ```
 
+### Robust long-running jobs, stall reports, and checkpoints
+
+The legacy constructors keep their original behavior and have no watchdog or
+checkpoint overhead. Services that process long or remote inputs can opt in
+per job with [FFMS_RobustOptions][RobustOptions] and the `WithOptions`
+constructors:
+
+```c++
+typedef struct FFMS_RobustOptions {
+    int EnableStallDetection;
+    int64_t StallTimeoutMs;        /* <= 0: 30000 */
+    int EnableCheckpoint;
+    int64_t CheckpointIntervalMs;  /* <= 0: 30000 */
+    const char *CheckpointFile;
+    const char *ReportFile;
+    TStallCallback StallCallback;
+    void *StallPrivate;
+    void *Reserved[8];
+} FFMS_RobustOptions;
+
+FFMS_Indexer *FFMS_CreateIndexerWithOptions(...);
+FFMS_VideoSource *FFMS_CreateVideoSourceWithOptions(...);
+FFMS_AudioSource *FFMS_CreateAudioSourceWithOptions(...);
+```
+
+`EnableStallDetection` installs an interrupt callback on all FFmpeg I/O and a
+small watchdog for the lifetime of the indexer/source. The watchdog considers
+an operation stalled only when there has been no position progress for
+`StallTimeoutMs` **and** the process is not consuming CPU. This distinction is
+important: a slow but actively decoding frame is not aborted, while a thread
+blocked forever in a socket read or decoder wait is. It does not replace
+FFmpeg's network timeouts and it does not require increasing an overall job
+timeout.
+
+When a stall is detected the operation is interrupted and the callback (if
+supplied) receives a `FFMS_StallInfo`. The error message and the automatic
+report contain the phase (`opening input`, `reading the next packet`,
+`decoding a frame`, etc.), last completed frame number, PTS, millisecond
+timestamp, and byte position. No operator intervention is needed to discover
+where the job stopped. `FFMS_ERROR_STALLED` identifies this failure type.
+The callback runs on the watchdog thread and must not block or destroy the
+source object; use it to forward the report to the service's monitoring path.
+
+`EnableCheckpoint` periodically writes a plain UTF-8 text checkpoint
+containing the last completed frame and enough resume state to continue an
+interrupted index scan. Sidecar names always end in `.checkpoint.txt` and
+start with `# FFMS2 checkpoint`; they can never be confused with media or an
+`.ffindex` output. Writes use a temporary file followed by an atomic rename,
+so a crash cannot leave a half-written checkpoint. The default names are:
+
+```text
+<source>.ffms2-index.checkpoint.txt
+<source>.ffms2-decode.checkpoint.txt
+<source>.ffms2-audio.checkpoint.txt
+```
+
+For URL inputs, where a sidecar next to the source is not meaningful, the
+default is a stable `ffms2-<basename>-<hash>-<kind>.checkpoint.txt` name in the
+current directory. Pass `CheckpointFile` explicitly when the service has a
+per-job work directory.
+
+Index checkpoints are rewritten at `CheckpointIntervalMs`; decode checkpoints
+contain only a small progress record, but still use the same interval to avoid
+unnecessary disk traffic. A failure is written immediately. The file is
+human-readable and intentionally simple; for example:
+
+```text
+# FFMS2 checkpoint v1
+kind=decode
+status=2
+track=0
+last_frame=1732
+last_pts=51960
+last_timestamp_ms=1732000
+last_file_position=92833421
+reason=no progress while reading the next packet
+```
+
+Read it with:
+
+```c++
+FFMS_CheckpointInfo Info;
+FFMS_ErrorInfo Error;
+FFMS_ReadCheckpoint(Path, &Info, &Error);
+int64_t ResumeFrame = Info.LastFrame + 1;
+```
+
+For indexing, passing the same robust options to a new indexer automatically
+validates the source signature, version, demuxer options, and track mask, then
+resumes from the durable packet position. If any of those changed, the stale
+checkpoint is rejected and a clean index is built. For decoding, the caller
+should request `LastFrame + 1` (or the corresponding output position) after
+reading a non-completed checkpoint. `FFMS_CHECKPOINT_COMPLETED` means there is
+nothing left to resume. Set `FFMS_DEBUG_CHECKPOINT=1` in the environment to
+print the reason when an otherwise valid checkpoint cannot be reused.
+
+`ReportFile` is written automatically for stalls and can also receive
+non-stall I/O failures. Set either switch to zero to disable that feature for
+one task; pass a null `FFMS_RobustOptions` to use the legacy constructors.
+
 ## Audio Filename Format Strings
 The following variables can be used:
 

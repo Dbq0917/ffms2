@@ -22,6 +22,7 @@
 #define UTILS_H
 
 #include "ffms.h"
+#include "robust.h"
 
 extern "C" {
 #include <libavutil/mem.h>
@@ -50,6 +51,8 @@ public:
     FFMS_Exception(int ErrorType, int SubType, const char *Message = "");
     FFMS_Exception(int ErrorType, int SubType, const std::string &Message);
     const std::string &GetErrorMessage() const { return _Message; }
+    int GetErrorType() const { return _ErrorType; }
+    int GetSubType() const { return _SubType; }
     int CopyOut(FFMS_ErrorInfo *ErrorInfo) const;
 };
 
@@ -61,7 +64,9 @@ std::unique_ptr<T> make_unique(Args&&... args) {
 void ClearErrorInfo(FFMS_ErrorInfo *ErrorInfo);
 void FillAP(FFMS_AudioProperties &AP, AVCodecContext *CTX, FFMS_Track &Frames);
 
-void LAVFOpenFile(const char *SourceFile, AVFormatContext *&FormatContext, int Track, const std::map<std::string, std::string> &LAVFOpts);
+void LAVFOpenFile(const char *SourceFile, AVFormatContext *&FormatContext, int Track,
+    const std::map<std::string, std::string> &LAVFOpts,
+    robust::StallMonitor *Monitor = nullptr);
 
 // RAII wrapper for AVPacket * that handles av_packet_alloc and av_packet_free.
 // av_packet_ref and av_packet_unref still need to be handled by user code.

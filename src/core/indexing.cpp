@@ -28,6 +28,9 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 extern "C" {
 #include <libavutil/avutil.h>
@@ -37,30 +40,154 @@ extern "C" {
 #define INDEXID 0x53920873
 #define INDEX_VERSION 8
 
+namespace {
+
+std::string HexDigest(const uint8_t Digest[20]) {
+    char Buffer[41];
+    for (int i = 0; i < 20; ++i)
+        std::snprintf(Buffer + i * 2, 3, "%02x", Digest[i]);
+    Buffer[40] = 0;
+    return Buffer;
+}
+
+std::string EscapeCheckpoint(const std::string &Value) {
+    std::string Out;
+    Out.reserve(Value.size());
+    for (size_t i = 0; i < Value.size(); ++i) {
+        switch (Value[i]) {
+        case '\\': Out += "\\\\"; break;
+        case '\n': Out += "\\n"; break;
+        case '\r': Out += "\\r"; break;
+        case '\t': Out += "\\t"; break;
+        default: Out += Value[i]; break;
+        }
+    }
+    return Out;
+}
+
+std::string UnescapeCheckpoint(const std::string &Value) {
+    std::string Out;
+    Out.reserve(Value.size());
+    for (size_t i = 0; i < Value.size(); ++i) {
+        if (Value[i] == '\\' && i + 1 < Value.size()) {
+            char Next = Value[++i];
+            if (Next == 'n')
+                Out += '\n';
+            else if (Next == 'r')
+                Out += '\r';
+            else if (Next == 't')
+                Out += '\t';
+            else
+                Out += Next;
+        } else {
+            Out += Value[i];
+        }
+    }
+    return Out;
+}
+
+std::string SerializeIndexMask(const std::set<int> &Mask) {
+    std::ostringstream Out;
+    for (std::set<int>::const_iterator It = Mask.begin(); It != Mask.end(); ++It) {
+        if (It != Mask.begin())
+            Out << ',';
+        Out << *It;
+    }
+    return Out.str();
+}
+
+std::map<std::string, std::string> SplitCheckpointSections(const std::string &Body) {
+    std::map<std::string, std::string> Sections;
+    std::istringstream In(Body);
+    std::string Line;
+    std::string Current;
+    while (std::getline(In, Line)) {
+        if (!Line.empty() && Line[Line.size() - 1] == '\r')
+            Line.pop_back();
+        if (!Line.empty() && Line[0] == '[' && Line[Line.size() - 1] == ']') {
+            Current = Line.substr(1, Line.size() - 2);
+            Sections[Current] = "";
+        } else if (!Current.empty()) {
+            Sections[Current] += Line + "\n";
+        }
+    }
+    return Sections;
+}
+
+std::vector<std::string> SplitTab(const std::string &Value) {
+    std::vector<std::string> Parts;
+    size_t Begin = 0;
+    while (true) {
+        size_t Tab = Value.find('\t', Begin);
+        if (Tab == std::string::npos) {
+            Parts.push_back(Value.substr(Begin));
+            break;
+        }
+        Parts.push_back(Value.substr(Begin, Tab - Begin));
+        Begin = Tab + 1;
+    }
+    return Parts;
+}
+
+std::map<std::string, std::string> ParseKeyPairs(const std::string &Section) {
+    std::map<std::string, std::string> Values;
+    std::istringstream In(Section);
+    std::string Line;
+    while (std::getline(In, Line)) {
+        size_t Eq = Line.find('=');
+        if (Eq != std::string::npos)
+            Values[Line.substr(0, Eq)] = UnescapeCheckpoint(Line.substr(Eq + 1));
+    }
+    return Values;
+}
+
+int RejectCheckpoint(const char *Reason) {
+    if (std::getenv("FFMS_DEBUG_CHECKPOINT"))
+        std::fprintf(stderr, "FFMS checkpoint resume rejected: %s\n", Reason);
+    return 0;
+}
+
+} // namespace
+
 SharedAVContext::~SharedAVContext() {
     avcodec_free_context(&CodecContext);
     if (Parser)
         av_parser_close(Parser);
 }
 
-void FFMS_Index::CalculateFileSignature(const char *Filename, int64_t *Filesize, uint8_t Digest[20]) {
-    FileHandle file(Filename, "rb", FFMS_ERROR_INDEX, FFMS_ERROR_FILE_READ);
-
+void FFMS_Index::CalculateFileSignature(const char *Filename, int64_t *Filesize, uint8_t Digest[20],
+    robust::StallMonitor *Monitor) {
     std::unique_ptr<AVSHA, decltype(&av_free)> ctx{ av_sha_alloc(), av_free };
     av_sha_init(ctx.get(), 160);
 
     try {
+        FileHandle file(Filename, "rb", FFMS_ERROR_INDEX, FFMS_ERROR_FILE_READ,
+            Monitor ? Monitor->GetInterruptCallback() : nullptr);
         *Filesize = file.Size();
+        if (Monitor)
+            Monitor->Touch();
         std::vector<char> FileBuffer(static_cast<size_t>(std::min<int64_t>(1024 * 1024, *Filesize)));
         size_t BytesRead = file.Read(FileBuffer.data(), FileBuffer.size());
+        if (Monitor) {
+            Monitor->Touch();
+            Monitor->Check("Reading the source file signature");
+        }
         av_sha_update(ctx.get(), reinterpret_cast<const uint8_t*>(FileBuffer.data()), BytesRead);
 
         if (*Filesize > static_cast<int64_t>(FileBuffer.size())) {
             file.Seek(*Filesize - static_cast<int64_t>(FileBuffer.size()), SEEK_SET);
+            if (Monitor)
+                Monitor->Touch();
             BytesRead = file.Read(FileBuffer.data(), FileBuffer.size());
+            if (Monitor) {
+                Monitor->Touch();
+                Monitor->Check("Reading the source file signature");
+            }
             av_sha_update(ctx.get(), reinterpret_cast<const uint8_t*>(FileBuffer.data()), BytesRead);
         }
     } catch (...) {
+        if (Monitor)
+            Monitor->Check("Reading the source file signature");
         av_sha_final(ctx.get(), Digest);
         throw;
     }
@@ -111,10 +238,12 @@ void FFMS_Index::Finalize(std::vector<SharedAVContext> const& video_contexts, co
     }
 }
 
-bool FFMS_Index::CompareFileSignature(const char *Filename) {
+bool FFMS_Index::CompareFileSignature(const char *Filename, robust::StallMonitor *Monitor) {
     int64_t CFilesize;
     uint8_t CDigest[20];
-    CalculateFileSignature(Filename, &CFilesize, CDigest);
+    CalculateFileSignature(Filename, &CFilesize, CDigest, Monitor);
+    if (Monitor)
+        Monitor->Check("Reading the source file signature");
     return (CFilesize == Filesize && !memcmp(CDigest, Digest, sizeof(Digest)));
 }
 
@@ -266,8 +395,18 @@ void FFMS_Indexer::SetProgressCallback(TIndexCallback IC_, void *ICPrivate_) {
 }
 
 FFMS_Indexer::FFMS_Indexer(const char *Filename, const FFMS_KeyValuePair *DemuxerOptions, int NumOptions)
-    : SourceFile(Filename) {
+    : FFMS_Indexer(Filename, DemuxerOptions, NumOptions, nullptr) {
+}
+
+FFMS_Indexer::FFMS_Indexer(const char *Filename, const FFMS_KeyValuePair *DemuxerOptions, int NumOptions,
+    const FFMS_RobustOptions *Options)
+    : SourceFile(Filename)
+    , RobustOptions(robust::Settings::FromOptions(Options, Filename, FFMS_CHECKPOINT_INDEX))
+    , Monitor(new robust::StallMonitor(RobustOptions, Filename)) {
     try {
+        Monitor->Start();
+        Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "avformat_open_input");
+
         AVDictionary *Dict = nullptr;
         for (int i = 0; i < NumOptions; i++) {
             if (!DemuxerOptions[i].Key && !DemuxerOptions[i].Value)
@@ -277,19 +416,34 @@ FFMS_Indexer::FFMS_Indexer(const char *Filename, const FFMS_KeyValuePair *Demuxe
             av_dict_set(&Dict, DemuxerOptions[i].Key, DemuxerOptions[i].Value, 0);
         }
 
-        if (avformat_open_input(&FormatContext, Filename, nullptr, &Dict) != 0)
+        FormatContext = avformat_alloc_context();
+        if (!FormatContext) {
+            av_dict_free(&Dict);
+            throw FFMS_Exception(FFMS_ERROR_INDEXING, FFMS_ERROR_ALLOCATION_FAILED,
+                "Couldn't allocate format context");
+        }
+        Monitor->Install(FormatContext);
+
+        if (avformat_open_input(&FormatContext, Filename, nullptr, &Dict) != 0) {
+            Monitor->Check("Opening input");
+            av_dict_free(&Dict);
             throw FFMS_Exception(FFMS_ERROR_PARSER, FFMS_ERROR_FILE_READ,
                 std::string("Can't open '") + Filename + "'");
+        }
 
         av_dict_free(&Dict);
 
-        FFMS_Index::CalculateFileSignature(Filename, &Filesize, Digest);
+        Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "reading the FFMS source signature (avio_read)");
+        FFMS_Index::CalculateFileSignature(Filename, &Filesize, Digest, Monitor.get());
 
+        Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "avformat_find_stream_info");
         if (avformat_find_stream_info(FormatContext, nullptr) < 0) {
+            Monitor->Check("Reading stream information");
             avformat_close_input(&FormatContext);
             throw FFMS_Exception(FFMS_ERROR_PARSER, FFMS_ERROR_FILE_READ,
                 "Couldn't find stream information");
         }
+        Monitor->Check("Reading stream information");
 
         for (unsigned int i = 0; i < FormatContext->nb_streams; i++)
             if (FormatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
@@ -299,6 +453,12 @@ FFMS_Indexer::FFMS_Indexer(const char *Filename, const FFMS_KeyValuePair *Demuxe
         if (!DecodeFrame)
             throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_ALLOCATION_FAILED,
                 "Couldn't allocate frame");
+    } catch (FFMS_Exception &e) {
+        robust::WriteFailureReport(RobustOptions, SourceFile, "opening/index initialization",
+            Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage(), -1, -1, AV_NOPTS_VALUE, -1, -1);
+        Free();
+        throw;
     } catch (...) {
         Free();
         throw;
@@ -406,12 +566,271 @@ void FFMS_Indexer::ParseVideoPacket(SharedAVContext &VideoContext, const AVPacke
 }
 
 void FFMS_Indexer::Free() {
+    if (Monitor)
+        Monitor->Stop();
     av_frame_free(&DecodeFrame);
     avformat_close_input(&FormatContext);
 }
 
 FFMS_Indexer::~FFMS_Indexer() {
     Free();
+}
+
+void FFMS_Indexer::WriteCheckpoint(const FFMS_Index &TrackIndices, int Status,
+    const std::string &Reason, bool Finalized,
+    const std::vector<SharedAVContext> &AVContexts,
+    const std::vector<int64_t> &LastValidTS,
+    enum AVPictureStructure LastPicStruct) {
+    if (!RobustOptions.Checkpoint)
+        return;
+
+    const int64_t Now = robust::SteadyNowNs();
+    if (Status == FFMS_CHECKPOINT_RUNNING &&
+        LastCheckpointWriteNs != 0 &&
+        Now - LastCheckpointWriteNs < RobustOptions.CheckpointIntervalMs * 1000000)
+        return;
+    LastCheckpointWriteNs = Now;
+
+    robust::CheckpointRecord Record;
+    Record.Kind = FFMS_CHECKPOINT_INDEX;
+    Record.Status = Status;
+    Record.Finalized = Finalized;
+    Record.Track = LastVideoTrack;
+    Record.LastFrame = LastFrame;
+    Record.LastPTS = LastPTS;
+    Record.LastTimestampMs = LastTimestampMs;
+    Record.LastFilePosition = LastFilePosition;
+    Record.Source = SourceFile;
+    Record.SourceSize = Filesize;
+    Record.Reason = Reason;
+    Record.UpdatedAtUnixMs = robust::UnixNowMs();
+    Record.Extra["source_sha1"] = HexDigest(Digest);
+    Record.Extra["ffms_version"] = std::to_string(FFMS_GetVersion());
+    Record.Extra["index_format_version"] = std::to_string(INDEX_VERSION);
+    Record.Extra["avutil_version"] = std::to_string(avutil_version());
+    Record.Extra["avformat_version"] = std::to_string(avformat_version());
+    Record.Extra["avcodec_version"] = std::to_string(avcodec_version());
+    Record.Extra["swscale_version"] = std::to_string(swscale_version());
+    Record.Extra["error_handling"] = std::to_string(ErrorHandling);
+    Record.Extra["track_count"] = std::to_string(TrackIndices.size());
+    Record.Extra["resumed"] = ResumedFromFrame >= 0 ? "1" : "0";
+    Record.Extra["resumed_from_frame"] = std::to_string(ResumedFromFrame);
+
+    std::ostringstream Body;
+    Body << "[resume]\n"
+         << "index_mask=" << EscapeCheckpoint(SerializeIndexMask(IndexMask)) << "\n"
+         << "last_pic_struct=" << static_cast<int>(LastPicStruct) << "\n"
+         << "last_packet_pos=" << LastPacketPos << "\n"
+         << "last_packet_stream=" << LastPacketStream << "\n"
+         << "last_packet_pts=" << LastPacketPTS << "\n"
+         << "last_packet_dts=" << LastPacketDTS << "\n"
+         << "last_packet_flags=" << LastPacketFlags << "\n"
+         << "last_valid_ts=";
+    for (size_t i = 0; i < LastValidTS.size(); ++i) {
+        if (i)
+            Body << ',';
+        Body << LastValidTS[i];
+    }
+    Body << "\ncurrent_sample=";
+    for (size_t i = 0; i < AVContexts.size(); ++i) {
+        if (i)
+            Body << ',';
+        Body << AVContexts[i].CurrentSample;
+    }
+    Body << "\n\n[options]\n";
+    for (std::map<std::string, std::string>::const_iterator It = LAVFOpts.begin(); It != LAVFOpts.end(); ++It)
+        Body << "option=" << EscapeCheckpoint(It->first) << '\t' << EscapeCheckpoint(It->second) << "\n";
+
+    for (size_t i = 0; i < TrackIndices.size(); ++i) {
+        Body << "\n[track " << i << "]\n";
+        TrackIndices[i].WriteCheckpoint(Body);
+    }
+
+    Record.Body = Body.str();
+    std::string IgnoredError;
+    robust::WriteCheckpoint(RobustOptions.CheckpointFile, Record, &IgnoredError);
+}
+
+int FFMS_Indexer::TryRestoreCheckpoint(FFMS_Index &TrackIndices,
+    std::vector<SharedAVContext> &AVContexts, std::vector<int64_t> &LastValidTS,
+    enum AVPictureStructure &LastPicStruct) {
+    if (!RobustOptions.Checkpoint)
+        return 0;
+
+    robust::CheckpointRecord Record;
+    std::string Error;
+    if (!robust::ReadCheckpoint(RobustOptions.CheckpointFile, Record, &Error))
+        return RejectCheckpoint(("cannot read checkpoint: " + Error).c_str());
+
+    if (Record.Kind != FFMS_CHECKPOINT_INDEX ||
+        Record.Source != SourceFile ||
+        Record.SourceSize != Filesize)
+        return RejectCheckpoint("checkpoint source or source size does not match");
+
+    std::map<std::string, std::string>::const_iterator It;
+    It = Record.Extra.find("source_sha1");
+    if (It == Record.Extra.end() || It->second != HexDigest(Digest))
+        return RejectCheckpoint("source digest changed");
+    It = Record.Extra.find("ffms_version");
+    if (It == Record.Extra.end() || std::strtoll(It->second.c_str(), nullptr, 10) != FFMS_GetVersion())
+        return RejectCheckpoint("ffms2 version changed");
+    It = Record.Extra.find("index_format_version");
+    if (It == Record.Extra.end() || std::atoi(It->second.c_str()) != INDEX_VERSION)
+        return RejectCheckpoint("index format version changed");
+    It = Record.Extra.find("avutil_version");
+    if (It == Record.Extra.end() || std::strtoull(It->second.c_str(), nullptr, 10) != avutil_version())
+        return RejectCheckpoint("libavutil version changed");
+    It = Record.Extra.find("avformat_version");
+    if (It == Record.Extra.end() || std::strtoull(It->second.c_str(), nullptr, 10) != avformat_version())
+        return RejectCheckpoint("libavformat version changed");
+    It = Record.Extra.find("avcodec_version");
+    if (It == Record.Extra.end() || std::strtoull(It->second.c_str(), nullptr, 10) != avcodec_version())
+        return RejectCheckpoint("libavcodec version changed");
+    It = Record.Extra.find("swscale_version");
+    if (It == Record.Extra.end() || std::strtoull(It->second.c_str(), nullptr, 10) != swscale_version())
+        return RejectCheckpoint("libswscale version changed");
+    It = Record.Extra.find("error_handling");
+    if (It == Record.Extra.end() || std::atoi(It->second.c_str()) != ErrorHandling)
+        return RejectCheckpoint("error handling mode changed");
+    It = Record.Extra.find("track_count");
+    if (It == Record.Extra.end() || std::strtoull(It->second.c_str(), nullptr, 10) != TrackIndices.size())
+        return RejectCheckpoint("track count changed");
+
+    std::map<std::string, std::string> Sections = SplitCheckpointSections(Record.Body);
+    std::map<std::string, std::string>::const_iterator ResumeIt = Sections.find("resume");
+    std::map<std::string, std::string>::const_iterator OptionsIt = Sections.find("options");
+    if (ResumeIt == Sections.end() || OptionsIt == Sections.end())
+        return RejectCheckpoint("resume or options section is missing");
+
+    std::map<std::string, std::string> Resume = ParseKeyPairs(ResumeIt->second);
+    if (Resume["index_mask"] != SerializeIndexMask(IndexMask))
+        return RejectCheckpoint("indexed track mask changed");
+
+    std::map<std::string, std::string> SavedOptions;
+    {
+        std::istringstream In(OptionsIt->second);
+        std::string Line;
+        while (std::getline(In, Line)) {
+            if (Line.compare(0, 7, "option=") != 0)
+                continue;
+            std::vector<std::string> Parts = SplitTab(UnescapeCheckpoint(Line.substr(7)));
+            if (Parts.size() == 2)
+                SavedOptions[Parts[0]] = Parts[1];
+            else if (Parts.size() == 1)
+                SavedOptions[Parts[0]] = "";
+        }
+    }
+    if (SavedOptions != LAVFOpts)
+        return RejectCheckpoint("demuxer options changed");
+
+    std::vector<FFMS_Track> RestoredTracks(TrackIndices.size());
+    for (size_t i = 0; i < TrackIndices.size(); ++i) {
+        std::ostringstream Name;
+        Name << "track " << i;
+        std::map<std::string, std::string>::const_iterator Section = Sections.find(Name.str());
+        if (Section == Sections.end())
+            return RejectCheckpoint("track section is missing");
+        if (!RestoredTracks[i].ReadCheckpoint(Section->second, Record.Finalized, Error))
+            return RejectCheckpoint(("cannot restore track: " + Error).c_str());
+        if (RestoredTracks[i].TT != TrackIndices[i].TT ||
+            RestoredTracks[i].TB.Num != TrackIndices[i].TB.Num ||
+            RestoredTracks[i].TB.Den != TrackIndices[i].TB.Den)
+            return RejectCheckpoint("track type or time base changed");
+    }
+
+    LastFrame = Record.LastFrame;
+    LastPTS = Record.LastPTS;
+    LastTimestampMs = Record.LastTimestampMs;
+    LastFilePosition = Record.LastFilePosition;
+    LastVideoTrack = Record.Track;
+    LastPacketPos = std::strtoll(Resume["last_packet_pos"].c_str(), nullptr, 10);
+    LastPacketStream = std::atoi(Resume["last_packet_stream"].c_str());
+    LastPacketPTS = std::strtoll(Resume["last_packet_pts"].c_str(), nullptr, 10);
+    LastPacketDTS = std::strtoll(Resume["last_packet_dts"].c_str(), nullptr, 10);
+    LastPacketFlags = std::atoi(Resume["last_packet_flags"].c_str());
+    LastPicStruct = static_cast<enum AVPictureStructure>(std::atoi(Resume["last_pic_struct"].c_str()));
+
+    if (Record.Status == FFMS_CHECKPOINT_COMPLETED && Record.Finalized) {
+        ResumedFromFrame = Record.LastFrame;
+        for (size_t i = 0; i < TrackIndices.size(); ++i)
+            TrackIndices[i] = RestoredTracks[i];
+        return 2;
+    }
+
+    if (LastPacketPos < 0)
+        return RejectCheckpoint("checkpoint has no resumable packet position");
+
+    bool Seeked = avformat_seek_file(FormatContext, -1, INT64_MIN, LastPacketPos, INT64_MAX,
+        AVSEEK_FLAG_BYTE) >= 0;
+    if (!Seeked && LastPacketStream >= 0) {
+        int64_t TargetTS = LastPacketPTS != AV_NOPTS_VALUE ? LastPacketPTS : LastPacketDTS;
+        if (TargetTS != AV_NOPTS_VALUE)
+            Seeked = av_seek_frame(FormatContext, LastPacketStream, TargetTS,
+                AVSEEK_FLAG_BACKWARD) >= 0;
+    }
+    if (!Seeked && LastVideoTrack >= 0 && LastPTS != AV_NOPTS_VALUE)
+        Seeked = av_seek_frame(FormatContext, LastVideoTrack, LastPTS,
+            AVSEEK_FLAG_BACKWARD) >= 0;
+    if (!Seeked && FormatContext->pb)
+        Seeked = avio_seek(FormatContext->pb, LastPacketPos, SEEK_SET) >= 0;
+    if (!Seeked)
+        return RejectCheckpoint("input cannot seek to the checkpoint position");
+    avformat_flush(FormatContext);
+    const auto ResumeFailed = [&]() {
+        RejectCheckpoint("packet at the checkpoint position could not be matched");
+        int RewindResult = avformat_seek_file(FormatContext, -1, INT64_MIN, 0, INT64_MAX,
+            AVSEEK_FLAG_BYTE | AVSEEK_FLAG_BACKWARD);
+        avformat_flush(FormatContext);
+        if (RewindResult < 0)
+            throw FFMS_Exception(FFMS_ERROR_CHECKPOINT, FFMS_ERROR_SEEKING,
+                "Checkpoint resume failed and the input could not be rewound for a clean rebuild");
+        return 0;
+    };
+
+    SmartAVPacket Packet;
+    bool Matched = false;
+    while (true) {
+        int Ret = av_read_frame(FormatContext, Packet.get());
+        if (Ret < 0)
+            return ResumeFailed();
+        if (Packet->pos > LastPacketPos) {
+            av_packet_unref(Packet.get());
+            return ResumeFailed();
+        }
+        if (Packet->pos == LastPacketPos &&
+            Packet->stream_index == LastPacketStream &&
+            Packet->pts == LastPacketPTS &&
+            Packet->dts == LastPacketDTS &&
+            Packet->flags == LastPacketFlags) {
+            Matched = true;
+            av_packet_unref(Packet.get());
+            break;
+        }
+        av_packet_unref(Packet.get());
+    }
+    if (!Matched)
+        return ResumeFailed();
+
+    LastValidTS.assign(LastValidTS.size(), AV_NOPTS_VALUE);
+    {
+        std::istringstream In(Resume["last_valid_ts"]);
+        std::string Value;
+        size_t Index = 0;
+        while (std::getline(In, Value, ',') && Index < LastValidTS.size())
+            LastValidTS[Index++] = std::strtoll(Value.c_str(), nullptr, 10);
+    }
+    {
+        std::istringstream In(Resume["current_sample"]);
+        std::string Value;
+        size_t Index = 0;
+        while (std::getline(In, Value, ',') && Index < AVContexts.size())
+            AVContexts[Index++].CurrentSample = std::strtoll(Value.c_str(), nullptr, 10);
+    }
+
+    for (size_t i = 0; i < TrackIndices.size(); ++i)
+        TrackIndices[i] = RestoredTracks[i];
+    ResumedFromFrame = Record.LastFrame;
+    return 1;
 }
 
 int FFMS_Indexer::GetNumberOfTracks() {
@@ -510,89 +929,186 @@ FFMS_Index *FFMS_Indexer::DoIndexing() {
 
     SmartAVPacket Packet;
     std::vector<int64_t> LastValidTS(FormatContext->nb_streams, AV_NOPTS_VALUE);
+    enum AVPictureStructure LastPicStruct = AV_PICTURE_STRUCTURE_UNKNOWN;
+
+    const int RestoreResult = TryRestoreCheckpoint(*TrackIndices, AVContexts, LastValidTS, LastPicStruct);
+    if (RestoreResult == 2) {
+        Monitor->Stop();
+        return TrackIndices.release();
+    }
+
+    std::vector<int64_t> VisibleFrames(FormatContext->nb_streams, 0);
+    if (RestoreResult == 1) {
+        for (size_t i = 0; i < TrackIndices->size(); ++i)
+            for (size_t f = 0; f < (*TrackIndices)[i].size(); ++f)
+                if (!(*TrackIndices)[i][f].Skipped())
+                    VisibleFrames[i]++;
+    } else {
+        LastFrame = -1;
+        LastPTS = AV_NOPTS_VALUE;
+        LastTimestampMs = -1;
+        LastFilePosition = -1;
+        LastVideoTrack = -1;
+        LastPacketPos = -1;
+        LastPacketPTS = AV_NOPTS_VALUE;
+        LastPacketDTS = AV_NOPTS_VALUE;
+        LastPacketStream = -1;
+        LastPacketFlags = 0;
+    }
 
     int64_t filesize = avio_size(FormatContext->pb);
-    enum AVPictureStructure LastPicStruct = AV_PICTURE_STRUCTURE_UNKNOWN;
-    int ret;
-    while ((ret = av_read_frame(FormatContext, Packet.get())) >= 0) {
-        // Update progress
-        // FormatContext->pb can apparently be NULL when opening images.
-        if (IC && FormatContext->pb) {
-            if ((*IC)(FormatContext->pb->pos, filesize, ICPrivate)) {
-                throw FFMS_Exception(FFMS_ERROR_CANCELLED, FFMS_ERROR_USER,
-                    "Cancelled by user");
+    int ret = 0;
+    Monitor->SetPhase(FFMS_ACTIVITY_READING, "av_read_frame while indexing packets");
+    Monitor->Touch();
+
+    try {
+        while ((ret = av_read_frame(FormatContext, Packet.get())) >= 0) {
+            Monitor->Check("Reading packet");
+            Monitor->Touch();
+
+            // Update progress
+            // FormatContext->pb can apparently be NULL when opening images.
+            if (IC && FormatContext->pb) {
+                if ((*IC)(FormatContext->pb->pos, filesize, ICPrivate)) {
+                    throw FFMS_Exception(FFMS_ERROR_CANCELLED, FFMS_ERROR_USER,
+                        "Cancelled by user");
+                }
             }
-        }
-        if (!IndexMask.count(Packet->stream_index)) {
-            av_packet_unref(Packet.get());
-            continue;
-        }
+            if (!IndexMask.count(Packet->stream_index)) {
+                av_packet_unref(Packet.get());
+                continue;
+            }
 
-        int Track = Packet->stream_index;
-        FFMS_Track &TrackInfo = (*TrackIndices)[Track];
-        bool KeyFrame = !!(Packet->flags & AV_PKT_FLAG_KEY);
-        ReadTS(*Packet, LastValidTS[Track], (*TrackIndices)[Track].UseDTS);
+            int Track = Packet->stream_index;
+            FFMS_Track &TrackInfo = (*TrackIndices)[Track];
+            bool KeyFrame = !!(Packet->flags & AV_PKT_FLAG_KEY);
+            ReadTS(*Packet, LastValidTS[Track], (*TrackIndices)[Track].UseDTS);
 
-        if (FormatContext->streams[Track]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            int64_t PTS = TrackInfo.UseDTS ? Packet->dts : Packet->pts;
-            if (PTS == AV_NOPTS_VALUE && !IsMpegLike) {
-                // VPx alt-refs are output as packets which lack timestmps or durations, since
-                // they are invisible. Currently, the timestamp mangling code in libavformat
-                // will sometimes add a bogus timestamp and duration, if the webm in question
-                // has the block duration set (which is a hack, and not really a frame duration
-                // at all). In the future, libav* will only output packets without timestamps
-                // or duration, so we need to handle it here, regardless. This does not handle
-                // NVOPs. We set the duration based on the last PTS, for these packets, because
-                // FFMS2 currently sorts packets by PTS, which will break decoding, otherwise.
-                bool HasAltRefs = (FormatContext->streams[Track]->codecpar->codec_id == AV_CODEC_ID_VP8 ||
-                                   FormatContext->streams[Track]->codecpar->codec_id == AV_CODEC_ID_VP9);
-                if (Packet->duration == 0 && !HasAltRefs) {
-                    throw FFMS_Exception(FFMS_ERROR_INDEXING, FFMS_ERROR_PARSER,
-                        "Invalid packet pts, dts, and duration");
+            if (FormatContext->streams[Track]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                int64_t PTS = TrackInfo.UseDTS ? Packet->dts : Packet->pts;
+                if (PTS == AV_NOPTS_VALUE && !IsMpegLike) {
+                    // VPx alt-refs are output as packets which lack timestmps or durations, since
+                    // they are invisible. Currently, the timestamp mangling code in libavformat
+                    // will sometimes add a bogus timestamp and duration, if the webm in question
+                    // has the block duration set (which is a hack, and not really a frame duration
+                    // at all). In the future, libav* will only output packets without timestamps
+                    // or duration, so we need to handle it here, regardless. This does not handle
+                    // NVOPs. We set the duration based on the last PTS, for these packets, because
+                    // FFMS2 currently sorts packets by PTS, which will break decoding, otherwise.
+                    bool HasAltRefs = (FormatContext->streams[Track]->codecpar->codec_id == AV_CODEC_ID_VP8 ||
+                                       FormatContext->streams[Track]->codecpar->codec_id == AV_CODEC_ID_VP9);
+                    if (Packet->duration == 0 && !HasAltRefs) {
+                        throw FFMS_Exception(FFMS_ERROR_INDEXING, FFMS_ERROR_PARSER,
+                            "Invalid packet pts, dts, and duration");
+                    }
+
+                    if (TrackInfo.empty())
+                        PTS = 0;
+                    else
+                        PTS = TrackInfo.back().PTS + TrackInfo.LastDuration;
+
+                    TrackInfo.HasTS = false;
                 }
 
-                if (TrackInfo.empty())
-                    PTS = 0;
-                else
-                    PTS = TrackInfo.back().PTS + TrackInfo.LastDuration;
+                int RepeatPict = -1;
+                int FrameType = 0;
+                bool Invisible = false;
+                bool SecondField = false;
+                ParseVideoPacket(AVContexts[Track], *Packet, &RepeatPict, &FrameType, &Invisible, &SecondField, &LastPicStruct);
 
-                TrackInfo.HasTS = false;
+                TrackInfo.AddVideoFrame(PTS, Packet->dts, RepeatPict, KeyFrame,
+                    FrameType, Packet->pos, Invisible, SecondField);
+
+                if (!Invisible && !SecondField) {
+                    LastFrame = VisibleFrames[Track]++;
+                    LastPTS = PTS;
+                    LastTimestampMs = av_rescale(PTS, TrackInfo.TB.Num, TrackInfo.TB.Den);
+                    LastFilePosition = Packet->pos;
+                    LastVideoTrack = Track;
+                    Monitor->SetPosition(Track, LastFrame, LastPTS, LastTimestampMs, LastFilePosition);
+                }
+            } else if (FormatContext->streams[Track]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                // For video seeking timestamps are used only if all packets have
+                // timestamps, while for audio they're used if any have timestamps,
+                // as it's pretty common for only some packets to have timestamps
+                if (LastValidTS[Track] != AV_NOPTS_VALUE)
+                    TrackInfo.HasTS = true;
+
+                int64_t StartSample = AVContexts[Track].CurrentSample;
+                uint32_t SampleCount = IndexAudioPacket(Track, *Packet, AVContexts[Track], *TrackIndices);
+                TrackInfo.SampleRate = AVContexts[Track].CodecContext->sample_rate;
+
+                TrackInfo.AddAudioFrame(LastValidTS[Track], Packet->dts,
+                    StartSample, SampleCount, KeyFrame, Packet->pos, Packet->flags & AV_PKT_FLAG_DISCARD);
             }
 
-            int RepeatPict = -1;
-            int FrameType = 0;
-            bool Invisible = false;
-            bool SecondField = false;
-            ParseVideoPacket(AVContexts[Track], *Packet, &RepeatPict, &FrameType, &Invisible, &SecondField, &LastPicStruct);
+            if (!(Packet->flags & AV_PKT_FLAG_DISCARD))
+                TrackInfo.LastDuration = Packet->duration;
 
-            TrackInfo.AddVideoFrame(PTS, Packet->dts, RepeatPict, KeyFrame,
-                FrameType, Packet->pos, Invisible, SecondField);
-        } else if (FormatContext->streams[Track]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            // For video seeking timestamps are used only if all packets have
-            // timestamps, while for audio they're used if any have timestamps,
-            // as it's pretty common for only some packets to have timestamps
-            if (LastValidTS[Track] != AV_NOPTS_VALUE)
-                TrackInfo.HasTS = true;
+            LastPacketPos = Packet->pos;
+            LastPacketPTS = Packet->pts;
+            LastPacketDTS = Packet->dts;
+            LastPacketStream = Packet->stream_index;
+            LastPacketFlags = Packet->flags;
 
-            int64_t StartSample = AVContexts[Track].CurrentSample;
-            uint32_t SampleCount = IndexAudioPacket(Track, *Packet, AVContexts[Track], *TrackIndices);
-            TrackInfo.SampleRate = AVContexts[Track].CodecContext->sample_rate;
-
-            TrackInfo.AddAudioFrame(LastValidTS[Track], Packet->dts,
-                StartSample, SampleCount, KeyFrame, Packet->pos, Packet->flags & AV_PKT_FLAG_DISCARD);
+            av_packet_unref(Packet.get());
+            WriteCheckpoint(*TrackIndices, FFMS_CHECKPOINT_RUNNING, "", false,
+                AVContexts, LastValidTS, LastPicStruct);
         }
 
-        if (!(Packet->flags & AV_PKT_FLAG_DISCARD))
-            TrackInfo.LastDuration = Packet->duration;
+        Monitor->Check("Reading input");
+        if (ret == AVERROR_EOF && FormatContext->pb &&
+            FormatContext->pb->error < 0 && FormatContext->pb->error != AVERROR_EOF)
+            throw FFMS_Exception(FFMS_ERROR_INDEXING, FFMS_ERROR_FILE_READ,
+                "Input ended unexpectedly at frame " + std::to_string(LastFrame) +
+                " (timestamp " + std::to_string(LastTimestampMs) + " ms): " +
+                AVErrorToString(FormatContext->pb->error));
+        if (IsIOError(ret))
+            throw FFMS_Exception(FFMS_ERROR_INDEXING, FFMS_ERROR_FILE_READ,
+                "Indexing failed at frame " + std::to_string(LastFrame) +
+                " (timestamp " + std::to_string(LastTimestampMs) + " ms): " + AVErrorToString(ret));
 
-        av_packet_unref(Packet.get());
+        Monitor->SetPhase(FFMS_ACTIVITY_FINALIZING, "FFMS_Index::Finalize");
+        Monitor->Touch();
+        TrackIndices->Finalize(AVContexts, FormatContext->iformat->name);
+        Monitor->Check("Finalizing the index");
+
+        if (LastVideoTrack >= 0 && (*TrackIndices)[LastVideoTrack].VisibleFrameCount() > 0) {
+            FFMS_Track &VideoTrackInfo = (*TrackIndices)[LastVideoTrack];
+            LastFrame = VideoTrackInfo.VisibleFrameCount() - 1;
+            const FFMS_FrameInfo *Info = VideoTrackInfo.GetFrameInfo(static_cast<size_t>(LastFrame));
+            if (Info) {
+                LastPTS = Info->PTS;
+                LastTimestampMs = av_rescale(Info->PTS, VideoTrackInfo.TB.Num, VideoTrackInfo.TB.Den);
+                LastFilePosition = VideoTrackInfo[VideoTrackInfo.RealFrameNumber(static_cast<int>(LastFrame))].FilePos;
+            }
+            Monitor->SetPosition(LastVideoTrack, LastFrame, LastPTS, LastTimestampMs, LastFilePosition);
+        }
+
+        WriteCheckpoint(*TrackIndices, FFMS_CHECKPOINT_COMPLETED, "", true,
+            AVContexts, LastValidTS, LastPicStruct);
+        Monitor->Stop();
+        return TrackIndices.release();
+    } catch (FFMS_Exception &e) {
+        const int Status = e.GetErrorType() == FFMS_ERROR_CANCELLED ? FFMS_CHECKPOINT_CANCELLED :
+            (Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED);
+        robust::WriteFailureReport(RobustOptions, SourceFile, "index scan", Status,
+            e.GetErrorMessage(), LastVideoTrack, LastFrame, LastPTS, LastTimestampMs,
+            LastFilePosition);
+        WriteCheckpoint(*TrackIndices, Status, e.GetErrorMessage(), false,
+            AVContexts, LastValidTS, LastPicStruct);
+        Monitor->Stop();
+        throw;
+    } catch (...) {
+        robust::WriteFailureReport(RobustOptions, SourceFile, "index scan",
+            Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            "unknown indexing failure", LastVideoTrack, LastFrame, LastPTS,
+            LastTimestampMs, LastFilePosition);
+        WriteCheckpoint(*TrackIndices, FFMS_CHECKPOINT_FAILED, "unknown indexing failure", false,
+            AVContexts, LastValidTS, LastPicStruct);
+        Monitor->Stop();
+        throw;
     }
-    if (IsIOError(ret))
-        throw FFMS_Exception(FFMS_ERROR_INDEXING, FFMS_ERROR_FILE_READ,
-            "Indexing failed: " + AVErrorToString(ret));
-
-    TrackIndices->Finalize(AVContexts, FormatContext->iformat->name);
-    return TrackIndices.release();
 }
 
 void FFMS_Indexer::ReadTS(const AVPacket &Packet, int64_t &TS, bool &UseDTS) {

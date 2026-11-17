@@ -1,4 +1,14 @@
 # FFmpegSource2 Changelog
+- Unreleased
+  - Added opt-in stall detection with FFmpeg interrupt callbacks and automatic
+    text reports including the last completed frame, PTS, timestamp, phase,
+    and byte position.
+  - Added resumable plain-text index and decode checkpoints with atomic
+    replacement, source/options validation, and per-task enable/disable
+    controls. Legacy constructors and outputs are unchanged.
+  - Added FFMS_ReadCheckpoint, FFMS_GetCheckpointFileName, and the
+    `WithOptions` indexer/source constructors.
+
 - 5.1
   - FFmpeg 7.1 is now the minimum requirement.
   - Added layered decoding support, for e.g. spatial MV-HEVC.

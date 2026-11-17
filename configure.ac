@@ -60,6 +60,13 @@ AS_CASE([$host],
 
 AM_CONDITIONAL([WINDOWS], [case "$host_os" in mingw* | cygwin*) true ;; *) false ;; esac])
 
+PTHREAD_FLAGS=""
+case "$host_os" in
+    mingw* | cygwin*) ;;
+    *) PTHREAD_FLAGS="-pthread" ;;
+esac
+AC_SUBST([PTHREAD_FLAGS])
+
 AC_PROG_LIBTOOL
 
 if echo "$host" | $GREP "cygwin" >/dev/null 2>&1 && test "$enable_shared" = "yes"; then

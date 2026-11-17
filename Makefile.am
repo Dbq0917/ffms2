@@ -16,11 +16,11 @@ AM_CPPFLAGS = \
 	@FFMPEG_CFLAGS@ \
 	@ZLIB_CPPFLAGS@ \
 	-include config.h
-AM_CXXFLAGS = -std=c++11 -fvisibility=hidden
+AM_CXXFLAGS = -std=c++11 -fvisibility=hidden @PTHREAD_FLAGS@
 
 lib_LTLIBRARIES = src/core/libffms2.la
 src_core_libffms2_la_LDFLAGS = @src_core_libffms2_la_LDFLAGS@
-src_core_libffms2_la_LIBADD = @FFMPEG_LIBS@ @ZLIB_LDFLAGS@ -lz @LTUNDEF@
+src_core_libffms2_la_LIBADD = @FFMPEG_LIBS@ @ZLIB_LDFLAGS@ -lz @LTUNDEF@ @PTHREAD_FLAGS@
 src_core_libffms2_la_SOURCES = \
 	src/core/audiosource.cpp \
 	src/core/audiosource.h \
@@ -29,6 +29,8 @@ src_core_libffms2_la_SOURCES = \
 	src/core/filehandle.h \
 	src/core/indexing.cpp \
 	src/core/indexing.h \
+	src/core/robust.cpp \
+	src/core/robust.h \
 	src/core/track.cpp \
 	src/core/track.h \
 	src/core/utils.cpp \
@@ -61,7 +63,7 @@ src_index_ffmsindex_LDFLAGS = -municode
 endif
 src_index_ffmsindex_LDADD = -lavutil src/core/libffms2.la
 
-.PHONY: test test-build test-clean test-sync test-run
+.PHONY: test test-build test-clean test-sync test-run test-robust
 clean-local: test-clean
 
 SAMPLES_DIR = $(abs_top_builddir)/test/samples
@@ -87,6 +89,9 @@ test-sync: test-setup
 
 test-run: test-build
 	@$(MAKE) -C test run USER_DIR=$(abs_top_srcdir) SAMPLES_DIR=$(SAMPLES_DIR) CXX="$(CXX)" AR="$(AR)" -k
+
+test-robust: test-build
+	@$(MAKE) -C test robust-run USER_DIR=$(abs_top_srcdir) CXX="$(CXX)" AR="$(AR)" ROBUST_TEST_FILE="$(ROBUST_TEST_FILE)"
 
 test-clean:
 	@$(MAKE) -C test clean USER_DIR=$(abs_top_srcdir) CXX="$(CXX)" AR="$(AR)"

@@ -38,6 +38,7 @@ extern "C" {
 
 #include "track.h"
 #include "utils.h"
+#include "robust.h"
 
 enum class DecodeStage {
     INITIALIZE_SOURCE,
@@ -114,9 +115,11 @@ private:
     AVFrame *DecodeFrame = nullptr;
     AVFrame *LastDecodedFrame = nullptr;
     int LastFrameNum = 0;
+    int64_t CompletedFrame = -1;
+    std::string SourceFile;
     FFMS_Index &Index;
     FFMS_Track Frames;
-    int VideoTrack;
+    int VideoTrack = -1;
     int CurrentFrame = 1;
     int DecodingThreads;
     AVCodecContext *CodecContext = nullptr;
@@ -125,6 +128,9 @@ private:
     bool SeekByPos = false;
     bool HaveSeenInterlacedFrame = false;
     bool IsLayered = false;
+    robust::Settings RobustOptions;
+    std::unique_ptr<robust::StallMonitor> Monitor;
+    int64_t LastCheckpointWriteNs = 0;
 
     void ReAdjustOutputFormat(AVFrame *Frame);
     FFMS_Frame *OutputFrame(AVFrame *Frame);
@@ -136,9 +142,12 @@ private:
     bool SeekTo(int n, int SeekOffset);
     int Seek(int n);
     void Free();
+    void WriteCheckpoint(int Status, const std::string &Reason);
     static void SanityCheckFrameForData(AVFrame *Frame);
 public:
     FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, int Track, int Threads, int SeekMode);
+    FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, int Track, int Threads, int SeekMode,
+        const FFMS_RobustOptions *Options);
     ~FFMS_VideoSource();
     const FFMS_VideoProperties& GetVideoProperties() { return VP; }
     FFMS_Track *GetTrack() { return &Frames; }

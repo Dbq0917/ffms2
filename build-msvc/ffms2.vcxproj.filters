@@ -45,6 +45,9 @@
     <ClCompile Include="..\src\core\indexing.cpp">
       <Filter>Indexing</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\core\robust.cpp">
+      <Filter>Indexing</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\core\track.cpp">
       <Filter>Indexing</Filter>
     </ClCompile>
@@ -87,6 +90,9 @@
       <Filter>Video</Filter>
     </ClInclude>
     <ClInclude Include="..\src\core\indexing.h">
+      <Filter>Indexing</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\core\robust.h">
       <Filter>Indexing</Filter>
     </ClInclude>
     <ClInclude Include="..\src\core\track.h">

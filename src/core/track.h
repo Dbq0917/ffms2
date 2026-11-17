@@ -24,6 +24,8 @@
 #include "ffms.h"
 
 #include <cstddef>
+#include <iosfwd>
+#include <string>
 #include <vector>
 #include <memory>
 
@@ -92,6 +94,8 @@ public:
 
     void WriteTimecodes(const char *TimecodeFile) const;
     void Write(ZipFile &Stream) const;
+    void WriteCheckpoint(std::ostream &Stream) const;
+    bool ReadCheckpoint(const std::string &Section, bool Finalized, std::string &Error);
 
     typedef frame_vec::allocator_type allocator_type;
     typedef frame_vec::size_type size_type;

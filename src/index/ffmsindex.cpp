@@ -49,10 +49,16 @@ bool Overwrite = false;
 bool PrintProgress = true;
 bool WriteTC = false;
 bool WriteKF = false;
+bool NoCheckpoint = false;
+bool NoStallDetection = false;
 int64_t ProgressInterval = 1000000; // One second
+int64_t StallTimeoutMs = 30000;
+int64_t CheckpointIntervalMs = 30000;
 std::vector<FFMS_KeyValuePair> LAVFOpts;
 std::string InputFile;
 std::string CacheFile;
+std::string CheckpointFile;
+std::string ReportFile;
 
 struct Error {
     std::string msg;
@@ -83,6 +89,12 @@ void PrintUsage() {
         "-s N      Set audio decoding error handling. See the documentation for details. (default: 0)\n"
         "-u N      Set the progress update frequency in seconds. Set to 0 for every percent. (default: 1)\n"
         "-o string Set demuxer options to be used in the form of 'key=val:key=val'. (default: none)\n"
+        "--checkpoint FILE       Write resumable plain-text progress to FILE. (default: <input>.ffms2-index.checkpoint.txt)\n"
+        "--no-checkpoint         Disable the checkpoint for this job.\n"
+        "--stall-timeout N       Report and abort after N seconds without progress. (default: 30)\n"
+        "--no-stall-detection    Disable stall detection for this job.\n"
+        "--checkpoint-interval N Update the checkpoint at most every N seconds. (default: 30)\n"
+        "--report FILE           Write automatic stall/failure reports to FILE.\n"
         "\n"
         "FFmpeg Demuxer Options:\n"
         "--enable_drefs\n"
@@ -158,6 +170,30 @@ void ParseCMDLine(int argc, const char *argv[]) {
             OPTION_ARG(ProgressInterval, "u", parseSecondsToMicroseconds);
         } else if (!strcmp(Option, "-o")) {
             OPTION_ARG(LAVFOpts, "o", parseDemuxerOpts);
+        } else if (!strcmp(Option, "--checkpoint")) {
+            if (i + 1 >= argc)
+                throw Error("Error: missing argument for --checkpoint");
+            CheckpointFile = argv[++i];
+        } else if (!strcmp(Option, "--no-checkpoint")) {
+            NoCheckpoint = true;
+        } else if (!strcmp(Option, "--stall-timeout")) {
+            if (i + 1 >= argc)
+                throw Error("Error: missing argument for --stall-timeout");
+            StallTimeoutMs = parseSecondsToMicroseconds(argv[++i]) / 1000;
+            if (StallTimeoutMs <= 0)
+                throw Error("Error: invalid argument specified for --stall-timeout");
+        } else if (!strcmp(Option, "--no-stall-detection")) {
+            NoStallDetection = true;
+        } else if (!strcmp(Option, "--checkpoint-interval")) {
+            if (i + 1 >= argc)
+                throw Error("Error: missing argument for --checkpoint-interval");
+            CheckpointIntervalMs = parseSecondsToMicroseconds(argv[++i]) / 1000;
+            if (CheckpointIntervalMs <= 0)
+                throw Error("Error: invalid argument specified for --checkpoint-interval");
+        } else if (!strcmp(Option, "--report")) {
+            if (i + 1 >= argc)
+                throw Error("Error: missing argument for --report");
+            ReportFile = argv[++i];
         } else if (!strcmp(Option, "--enable_drefs")) {
             parseDemuxerOpts("enable_drefs=1");
         } else if (!strcmp(Option, "--use_absolute_path")) {
@@ -177,8 +213,17 @@ void ParseCMDLine(int argc, const char *argv[]) {
         throw Error("Error: no input file specified");
 
     if (CacheFile.empty()) {
-        CacheFile = InputFile;
-        CacheFile.append(".ffindex");
+        size_t Scheme = InputFile.find("://");
+        if (Scheme != std::string::npos) {
+            size_t Slash = InputFile.find_last_of('/');
+            std::string Base = Slash == std::string::npos ? "input" : InputFile.substr(Slash + 1);
+            if (Base.empty())
+                Base = "input";
+            CacheFile = Base + ".ffindex";
+        } else {
+            CacheFile = InputFile;
+            CacheFile.append(".ffindex");
+        }
     }
 }
 
@@ -228,7 +273,16 @@ void DoIndexing() {
 
     UpdateProgress(0, 100, nullptr);
 
-    FFMS_Indexer *Indexer = FFMS_CreateIndexer2(InputFile.c_str(), LAVFOpts.data(), LAVFOpts.size(), &E);
+    FFMS_RobustOptions Robust = {};
+    Robust.EnableStallDetection = NoStallDetection ? 0 : 1;
+    Robust.StallTimeoutMs = StallTimeoutMs;
+    Robust.EnableCheckpoint = NoCheckpoint ? 0 : 1;
+    Robust.CheckpointIntervalMs = CheckpointIntervalMs;
+    Robust.CheckpointFile = CheckpointFile.empty() ? nullptr : CheckpointFile.c_str();
+    Robust.ReportFile = ReportFile.empty() ? nullptr : ReportFile.c_str();
+
+    FFMS_Indexer *Indexer = FFMS_CreateIndexerWithOptions(InputFile.c_str(), LAVFOpts.data(),
+        LAVFOpts.size(), &Robust, &E);
     if (Indexer == nullptr)
         throw Error("\nFailed to initialize indexing: ", E);
 

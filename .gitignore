@@ -51,6 +51,7 @@
 /test/*.o
 /test/*.a
 /test/indexer
+/test/robust
 
 
 ### Autotools ###

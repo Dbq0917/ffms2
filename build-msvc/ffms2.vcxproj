@@ -159,6 +159,7 @@
     <ClCompile Include="..\src\core\ffms.cpp" />
     <ClCompile Include="..\src\core\filehandle.cpp" />
     <ClCompile Include="..\src\core\indexing.cpp" />
+    <ClCompile Include="..\src\core\robust.cpp" />
     <ClCompile Include="..\src\core\track.cpp" />
     <ClCompile Include="..\src\core\utils.cpp" />
     <ClCompile Include="..\src\core\videosource.cpp" />
@@ -174,6 +175,7 @@
     <ClInclude Include="..\src\core\audiosource.h" />
     <ClInclude Include="..\src\core\filehandle.h" />
     <ClInclude Include="..\src\core\indexing.h" />
+    <ClInclude Include="..\src\core\robust.h" />
     <ClInclude Include="..\src\core\track.h" />
     <ClInclude Include="..\src\core\utils.h" />
     <ClInclude Include="..\src\core\videosource.h" />

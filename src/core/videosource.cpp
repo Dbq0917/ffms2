@@ -23,6 +23,20 @@
 #include "videoutils.h"
 #include <algorithm>
 #include <thread>
+#include <cstdio>
+#include <sstream>
+
+namespace {
+
+std::string HexDigest20(const uint8_t Digest[20]) {
+    char Buffer[41];
+    for (int i = 0; i < 20; ++i)
+        std::snprintf(Buffer + i * 2, 3, "%02x", Digest[i]);
+    Buffer[40] = 0;
+    return Buffer;
+}
+
+} // namespace
 
 
 void DecoderDelay::Reset() {
@@ -223,9 +237,21 @@ FFMS_Frame *FFMS_VideoSource::OutputFrame(AVFrame *Frame) {
 }
 
 FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, int Track, int Threads, int SeekMode)
-    : Index(Index), SeekMode(SeekMode) {
+    : FFMS_VideoSource(SourceFile, Index, Track, Threads, SeekMode, nullptr) {
+}
+
+FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, int Track, int Threads, int SeekMode,
+    const FFMS_RobustOptions *Options)
+    : SourceFile(SourceFile ? SourceFile : "")
+    , Index(Index)
+    , SeekMode(SeekMode)
+    , RobustOptions(robust::Settings::FromOptions(Options, SourceFile, FFMS_CHECKPOINT_DECODE))
+    , Monitor(new robust::StallMonitor(RobustOptions, SourceFile)) {
 
     try {
+        Monitor->Start();
+        Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "avformat_open_input (video source)");
+
         if (Track < 0 || Track >= static_cast<int>(Index.size()))
             throw FFMS_Exception(FFMS_ERROR_INDEX, FFMS_ERROR_INVALID_ARGUMENT,
                 "Out of bounds track index selected");
@@ -238,9 +264,11 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
             throw FFMS_Exception(FFMS_ERROR_INDEX, FFMS_ERROR_INVALID_ARGUMENT,
                 "Video track contains no frames");
 
-        if (!Index.CompareFileSignature(SourceFile))
+        Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "validating the source signature (avio_read)");
+        if (!Index.CompareFileSignature(SourceFile, Monitor.get()))
             throw FFMS_Exception(FFMS_ERROR_INDEX, FFMS_ERROR_FILE_MISMATCH,
                 "The index does not match the source file");
+        Monitor->Check("Validating the source file");
 
         Frames = Index[Track];
         VideoTrack = Track;
@@ -262,7 +290,9 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
             throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_ALLOCATION_FAILED,
                 "Could not allocate dummy frame.");
 
-        LAVFOpenFile(SourceFile, FormatContext, VideoTrack, Index.LAVFOpts);
+        LAVFOpenFile(SourceFile, FormatContext, VideoTrack, Index.LAVFOpts, Monitor.get());
+        Monitor->Install(FormatContext);
+        Monitor->Check("Opening the video source");
 
         auto *Codec = avcodec_find_decoder(FormatContext->streams[VideoTrack]->codecpar->codec_id);
         if (Codec == nullptr)
@@ -483,7 +513,12 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
             VP.ContentLightLevelMax = LocalFrame.ContentLightLevelMax;
             VP.ContentLightLevelAverage = LocalFrame.ContentLightLevelAverage;
         }
-    } catch (FFMS_Exception &) {
+    } catch (FFMS_Exception &e) {
+        robust::WriteFailureReport(RobustOptions, SourceFile, "opening video source",
+            Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage(), VideoTrack, -1, AV_NOPTS_VALUE, -1, -1);
+        WriteCheckpoint(Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage());
         Free();
         throw;
     }
@@ -799,6 +834,8 @@ bool FFMS_VideoSource::DecodePacket(const AVPacket &Packet) {
 int FFMS_VideoSource::Seek(int n) {
     int ret = -1;
 
+    Monitor->SetPhase(FFMS_ACTIVITY_SEEKING, "av_seek_frame (video decode point)");
+    Monitor->Touch();
     Delay.Reset();
     if (Stage != DecodeStage::INITIALIZE_SOURCE)
         Stage = DecodeStage::INITIALIZE;
@@ -812,6 +849,8 @@ int FFMS_VideoSource::Seek(int n) {
         if (ret >= 0)
             SeekByPos = true;
     }
+    Monitor->Check("Seeking");
+    Monitor->SetPhase(FFMS_ACTIVITY_READING, "av_read_frame (video packet)");
 
     // We always assume seeking is possible if the first seek succeeds
     avcodec_flush_buffers(CodecContext);
@@ -826,6 +865,8 @@ int FFMS_VideoSource::Seek(int n) {
 }
 
 void FFMS_VideoSource::Free() {
+    if (Monitor)
+        Monitor->Stop();
     av_freep(&RPUBuffer);
     av_freep(&HDR10PlusBuffer);
     avcodec_free_context(&CodecContext);
@@ -842,6 +883,9 @@ void FFMS_VideoSource::Free() {
 SmartAVPacket FFMS_VideoSource::DecodeNextFrame() {
     SmartAVPacket Packet, FirstPacket;
 
+    Monitor->SetPhase(FFMS_ACTIVITY_READING, "av_read_frame (video packet)");
+    Monitor->Touch();
+
     if (HasPendingDelayedFrames())
         return FirstPacket;
 
@@ -855,16 +899,21 @@ SmartAVPacket FFMS_VideoSource::DecodeNextFrame() {
     } else {
         ret = av_read_frame(FormatContext, Packet.get());
     }
+    Monitor->Check("Reading a video packet");
+    Monitor->Touch();
     while (ret >= 0) {
         if (Packet->stream_index != VideoTrack) {
             av_packet_unref(Packet.get());
             ret = av_read_frame(FormatContext, Packet.get());
+            Monitor->Check("Reading a video packet");
+            Monitor->Touch();
             continue;
         }
 
         if (!FirstPacket->data)
             av_packet_ref(FirstPacket.get(), Packet.get());
 
+        Monitor->SetPhase(FFMS_ACTIVITY_DECODING, "avcodec_send_packet/avcodec_receive_frame (video)");
         bool FrameFinished = DecodePacket(*Packet);
         if (ResendPacket)
             av_packet_ref(StashedPacket.get(), Packet.get());
@@ -878,14 +927,38 @@ SmartAVPacket FFMS_VideoSource::DecodeNextFrame() {
             av_packet_ref(Packet.get(), StashedPacket.get());
             av_packet_unref(StashedPacket.get());
         } else {
+            Monitor->SetPhase(FFMS_ACTIVITY_READING, "av_read_frame (video packet)");
             ret = av_read_frame(FormatContext, Packet.get());
+            Monitor->Check("Reading a video packet");
+            Monitor->Touch();
         }
     }
-    if (IsIOError(ret))
+    Monitor->Check("Reading a video packet");
+    if (ret == AVERROR_EOF && FormatContext->pb &&
+        FormatContext->pb->error < 0 && FormatContext->pb->error != AVERROR_EOF) {
+        std::string Location = " before frame 0";
+        if (CompletedFrame >= 0) {
+            const FrameInfo &Info = Frames[Frames.RealFrameNumber(static_cast<int>(CompletedFrame))];
+            Location = " after frame " + std::to_string(CompletedFrame) +
+                " (timestamp " + std::to_string(av_rescale(Info.PTS, Frames.TB.Num, Frames.TB.Den)) + " ms)";
+        }
         throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_FILE_READ,
-            "Failed to read packet: " + AVErrorToString(ret));
+            "Input ended unexpectedly" + Location + ": " + AVErrorToString(FormatContext->pb->error));
+    }
+    if (IsIOError(ret))
+    {
+        std::string Location = " before frame 0";
+        if (CompletedFrame >= 0) {
+            const FrameInfo &Info = Frames[Frames.RealFrameNumber(static_cast<int>(CompletedFrame))];
+            Location = " after frame " + std::to_string(CompletedFrame) +
+                " (timestamp " + std::to_string(av_rescale(Info.PTS, Frames.TB.Num, Frames.TB.Den)) + " ms)";
+        }
+        throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_FILE_READ,
+            "Failed to read packet" + Location + ": " + AVErrorToString(ret));
+    }
 
     // Flush final frames
+    Monitor->SetPhase(FFMS_ACTIVITY_DECODING, "avcodec_send_packet/avcodec_receive_frame (video flush)");
     DecodePacket(*Packet);
     return FirstPacket;
 }
@@ -934,11 +1007,21 @@ bool FFMS_VideoSource::SeekTo(int n, int SeekOffset) {
 
 FFMS_Frame *FFMS_VideoSource::GetFrame(int n) {
     GetFrameCheck(n);
+    const int RequestedFrame = n;
     n = Frames.RealFrameNumber(n);
 
-    if (Stage != DecodeStage::INITIALIZE_SOURCE && LastFrameNum == n)
+    if (Stage != DecodeStage::INITIALIZE_SOURCE && LastFrameNum == n) {
+        CompletedFrame = RequestedFrame;
+        const FrameInfo &Info = Frames[n];
+        Monitor->SetPosition(VideoTrack, CompletedFrame, Info.PTS,
+            av_rescale(Info.PTS, Frames.TB.Num, Frames.TB.Den), Info.FilePos);
+        Monitor->Touch();
+        WriteCheckpoint(CompletedFrame == VP.NumFrames - 1 ?
+            FFMS_CHECKPOINT_COMPLETED : FFMS_CHECKPOINT_RUNNING, "");
         return &LocalFrame;
+    }
 
+    try {
     int SeekOffset = 0;
     bool Seek = true;
     bool WasSkipped = false;
@@ -1012,5 +1095,65 @@ FFMS_Frame *FFMS_VideoSource::GetFrame(int n) {
     } while (++CurrentFrame <= n);
 
     LastFrameNum = n;
-    return OutputFrame(DecodeFrame);
+    FFMS_Frame *Frame = OutputFrame(DecodeFrame);
+    CompletedFrame = RequestedFrame;
+    const FrameInfo &Info = Frames[n];
+    Monitor->SetPosition(VideoTrack, CompletedFrame, Info.PTS,
+        av_rescale(Info.PTS, Frames.TB.Num, Frames.TB.Den), Info.FilePos);
+    Monitor->Touch();
+    WriteCheckpoint(CompletedFrame == VP.NumFrames - 1 ?
+        FFMS_CHECKPOINT_COMPLETED : FFMS_CHECKPOINT_RUNNING, "");
+    return Frame;
+    } catch (FFMS_Exception &e) {
+        robust::WriteFailureReport(RobustOptions, SourceFile, "video decode",
+            Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage(), VideoTrack, CompletedFrame,
+            CompletedFrame >= 0 ? Frames[Frames.RealFrameNumber(static_cast<int>(CompletedFrame))].PTS : AV_NOPTS_VALUE,
+            CompletedFrame >= 0 ? av_rescale(Frames[Frames.RealFrameNumber(static_cast<int>(CompletedFrame))].PTS,
+                Frames.TB.Num, Frames.TB.Den) : -1,
+            CompletedFrame >= 0 ? Frames[Frames.RealFrameNumber(static_cast<int>(CompletedFrame))].FilePos : -1);
+        WriteCheckpoint(Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage());
+        throw;
+    }
+}
+
+void FFMS_VideoSource::WriteCheckpoint(int Status, const std::string &Reason) {
+    if (!RobustOptions.Checkpoint)
+        return;
+
+    const int64_t Now = robust::SteadyNowNs();
+    if (Status == FFMS_CHECKPOINT_RUNNING &&
+        LastCheckpointWriteNs != 0 &&
+        Now - LastCheckpointWriteNs < RobustOptions.CheckpointIntervalMs * 1000000)
+        return;
+    if (Status != FFMS_CHECKPOINT_RUNNING)
+        LastCheckpointWriteNs = Now;
+
+    robust::CheckpointRecord Record;
+    Record.Kind = FFMS_CHECKPOINT_DECODE;
+    Record.Status = Status;
+    Record.Finalized = false;
+    Record.Track = VideoTrack;
+    Record.LastFrame = CompletedFrame;
+    Record.Source = SourceFile;
+    Record.SourceSize = Index.Filesize;
+    Record.Reason = Reason;
+    Record.UpdatedAtUnixMs = robust::UnixNowMs();
+    Record.Extra["source_sha1"] = HexDigest20(Index.Digest);
+    Record.Extra["ffms_version"] = std::to_string(FFMS_GetVersion());
+    if (CompletedFrame >= 0 && CompletedFrame < VP.NumFrames) {
+        const FrameInfo &Info = Frames[Frames.RealFrameNumber(static_cast<int>(CompletedFrame))];
+        Record.LastPTS = Info.PTS;
+        Record.LastTimestampMs = av_rescale(Info.PTS, Frames.TB.Num, Frames.TB.Den);
+        Record.LastFilePosition = Info.FilePos;
+    }
+    std::ostringstream Body;
+    Body << "[decode]\n"
+         << "resume_frame=" << (CompletedFrame + 1) << "\n"
+         << "total_frames=" << VP.NumFrames << "\n";
+    Record.Body = Body.str();
+
+    std::string IgnoredError;
+    robust::WriteCheckpoint(RobustOptions.CheckpointFile, Record, &IgnoredError);
 }

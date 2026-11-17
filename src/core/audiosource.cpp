@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <sstream>
 
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -54,8 +56,22 @@ namespace {
 }
 
 FFMS_AudioSource::FFMS_AudioSource(const char *SourceFile, FFMS_Index &Index, int Track, int DelayMode, int FillGaps, double DrcScale)
-    : DrcScale(DrcScale), LastValidTS(AV_NOPTS_VALUE), SourceFile(SourceFile), ResampleContext{ swr_alloc() }, TrackNumber(Track) {
+    : FFMS_AudioSource(SourceFile, Index, Track, DelayMode, FillGaps, DrcScale, nullptr) {
+}
+
+FFMS_AudioSource::FFMS_AudioSource(const char *SourceFile, FFMS_Index &Index, int Track, int DelayMode, int FillGaps, double DrcScale,
+    const FFMS_RobustOptions *Options)
+    : DrcScale(DrcScale)
+    , LastValidTS(AV_NOPTS_VALUE)
+    , SourceFile(SourceFile ? SourceFile : "")
+    , ResampleContext{ swr_alloc() }
+    , TrackNumber(Track)
+    , RobustOptions(robust::Settings::FromOptions(Options, SourceFile, FFMS_CHECKPOINT_AUDIO))
+    , Monitor(new robust::StallMonitor(RobustOptions, SourceFile)) {
     try {
+        Monitor->Start();
+        Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "avformat_open_input (audio source)");
+
         if (FillGaps < -1 || FillGaps > 1)
             throw FFMS_Exception(FFMS_ERROR_INDEX, FFMS_ERROR_INVALID_ARGUMENT,
                 "Invalid gap fill mode");
@@ -72,12 +88,15 @@ FFMS_AudioSource::FFMS_AudioSource(const char *SourceFile, FFMS_Index &Index, in
             throw FFMS_Exception(FFMS_ERROR_INDEX, FFMS_ERROR_INVALID_ARGUMENT,
                 "Audio track contains no audio frames");
 
-        if (!Index.CompareFileSignature(SourceFile))
+        Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "validating the source signature (avio_read)");
+        if (!Index.CompareFileSignature(SourceFile, Monitor.get()))
             throw FFMS_Exception(FFMS_ERROR_INDEX, FFMS_ERROR_FILE_MISMATCH,
                 "The index does not match the source file");
+        Monitor->Check("Validating the source file");
 
         Frames = Index[Track];
         LAVFOpts = Index.LAVFOpts;
+        SourceSize = Index.Filesize;
 
         DecodeFrame = av_frame_alloc();
         if (!DecodeFrame)
@@ -94,6 +113,14 @@ FFMS_AudioSource::FFMS_AudioSource(const char *SourceFile, FFMS_Index &Index, in
             SeekOffset = 10;
 
         Init(Index, DelayMode);
+    } catch (FFMS_Exception &e) {
+        robust::WriteFailureReport(RobustOptions, SourceFile, "opening audio source",
+            Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage(), TrackNumber, -1, AV_NOPTS_VALUE, -1, -1);
+        WriteCheckpoint(Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage());
+        Free();
+        throw;
     } catch (...) {
         Free();
         throw;
@@ -312,6 +339,7 @@ int FFMS_AudioSource::DecodeNextBlock(CacheIterator *pos) {
     CurrentSample = CurrentFrame->SampleStart;
 
     // Value code intentionally ignored, combined with the checks when indexing this mostly gives the expected behavior
+    Monitor->SetPhase(FFMS_ACTIVITY_DECODING, "avcodec_send_packet/avcodec_receive_frame (audio)");
     avcodec_send_packet(CodecContext, Packet.get());
 
     int NumberOfSamples = 0;
@@ -369,6 +397,9 @@ static bool SampleStartComp(const FrameInfo &a, const FrameInfo &b) {
 }
 
 void FFMS_AudioSource::GetAudio(void *Buf, int64_t Start, int64_t Count) {
+    const int64_t RequestedStart = Start;
+    const int64_t RequestedCount = Count;
+    try {
     if (Start < 0 || Start + Count > AP.NumSamples || Count < 0)
         throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_INVALID_ARGUMENT,
             "Out of bounds audio samples requested");
@@ -448,6 +479,25 @@ void FFMS_AudioSource::GetAudio(void *Buf, int64_t Start, int64_t Count) {
             --it;
         }
     }
+
+    CompletedPacket = PacketNumber > 0 ? static_cast<int64_t>(PacketNumber - 1) : -1;
+    CompletedSamples = RequestedStart + RequestedCount;
+    WriteCheckpoint(CompletedSamples >= AP.NumSamples ?
+        FFMS_CHECKPOINT_COMPLETED : FFMS_CHECKPOINT_RUNNING, "");
+    } catch (FFMS_Exception &e) {
+        robust::WriteFailureReport(RobustOptions, SourceFile, "audio decode",
+            Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage(), TrackNumber, CompletedPacket,
+            CompletedPacket >= 0 && static_cast<size_t>(CompletedPacket) < Frames.size() ?
+                Frames[CompletedPacket].PTS : AV_NOPTS_VALUE,
+            CompletedPacket >= 0 && static_cast<size_t>(CompletedPacket) < Frames.size() ?
+                av_rescale(Frames[CompletedPacket].PTS, Frames.TB.Num, Frames.TB.Den) : -1,
+            CompletedPacket >= 0 && static_cast<size_t>(CompletedPacket) < Frames.size() ?
+                Frames[CompletedPacket].FilePos : -1);
+        WriteCheckpoint(Monitor->Aborted() ? FFMS_CHECKPOINT_STALLED : FFMS_CHECKPOINT_FAILED,
+            e.GetErrorMessage());
+        throw;
+    }
 }
 
 size_t FFMS_AudioSource::GetSeekablePacketNumber(FFMS_Track const& Frames, size_t PacketNumber) {
@@ -487,10 +537,12 @@ size_t FFMS_AudioSource::GetSeekablePacketNumber(FFMS_Track const& Frames, size_
 }
 
 void FFMS_AudioSource::OpenFile() {
+    Monitor->SetPhase(FFMS_ACTIVITY_OPENING, "avformat_open_input (audio source)");
     avcodec_free_context(&CodecContext);
     avformat_close_input(&FormatContext);
 
-    LAVFOpenFile(SourceFile.c_str(), FormatContext, TrackNumber, LAVFOpts);
+    LAVFOpenFile(SourceFile.c_str(), FormatContext, TrackNumber, LAVFOpts, Monitor.get());
+    Monitor->Check("Opening the audio source");
 
     auto *Codec = avcodec_find_decoder(FormatContext->streams[TrackNumber]->codecpar->codec_id);
     if (Codec == nullptr)
@@ -518,6 +570,8 @@ void FFMS_AudioSource::OpenFile() {
 }
 
 void FFMS_AudioSource::Free() {
+    if (Monitor)
+        Monitor->Stop();
     av_frame_free(&DecodeFrame);
     avcodec_free_context(&CodecContext);
     avformat_close_input(&FormatContext);
@@ -532,6 +586,7 @@ int64_t FFMS_AudioSource::FrameTS(size_t Packet) const {
 }
 
 void FFMS_AudioSource::Seek() {
+    Monitor->SetPhase(FFMS_ACTIVITY_SEEKING, "av_seek_frame (audio packet)");
     size_t TargetPacket = GetSeekablePacketNumber(Frames, PacketNumber);
     LastValidTS = AV_NOPTS_VALUE;
 
@@ -539,6 +594,9 @@ void FFMS_AudioSource::Seek() {
 
     if (av_seek_frame(FormatContext, TrackNumber, FrameTS(TargetPacket), Flags) < 0)
         av_seek_frame(FormatContext, TrackNumber, FrameTS(TargetPacket), Flags | AVSEEK_FLAG_ANY);
+    Monitor->Check("Seeking audio");
+    Monitor->Touch();
+    Monitor->SetPhase(FFMS_ACTIVITY_READING, "av_read_frame (audio packet)");
 
     if (TargetPacket != PacketNumber) {
         // Decode until the PTS changes so we know where we are
@@ -548,7 +606,23 @@ void FFMS_AudioSource::Seek() {
 }
 
 bool FFMS_AudioSource::ReadPacket(AVPacket &Packet) {
-    while (av_read_frame(FormatContext, &Packet) >= 0) {
+    Monitor->SetPhase(FFMS_ACTIVITY_READING, "av_read_frame (audio packet)");
+    while (true) {
+        int ReadResult = av_read_frame(FormatContext, &Packet);
+        Monitor->Check("Reading an audio packet");
+        Monitor->Touch();
+        if (ReadResult < 0) {
+            if (ReadResult == AVERROR_EOF && FormatContext->pb &&
+                FormatContext->pb->error < 0 && FormatContext->pb->error != AVERROR_EOF)
+                throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_FILE_READ,
+                    "Input ended unexpectedly at audio sample " + std::to_string(CompletedSamples) +
+                    ": " + AVErrorToString(FormatContext->pb->error));
+            if (IsIOError(ReadResult))
+                throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_FILE_READ,
+                    "Failed to read audio packet after sample " + std::to_string(CompletedSamples) +
+                    ": " + AVErrorToString(ReadResult));
+            break;
+        }
         if (Packet.stream_index == TrackNumber) {
             // Required because not all audio packets, especially in ogg, have a pts. Use the previous valid packet's pts instead.
             if (Packet.pts == AV_NOPTS_VALUE)
@@ -567,5 +641,42 @@ bool FFMS_AudioSource::ReadPacket(AVPacket &Packet) {
         av_packet_unref(&Packet);
     }
     return false;
+}
+
+void FFMS_AudioSource::WriteCheckpoint(int Status, const std::string &Reason) {
+    if (!RobustOptions.Checkpoint)
+        return;
+
+    const int64_t Now = robust::SteadyNowNs();
+    if (Status == FFMS_CHECKPOINT_RUNNING &&
+        LastCheckpointWriteNs != 0 &&
+        Now - LastCheckpointWriteNs < RobustOptions.CheckpointIntervalMs * 1000000)
+        return;
+    if (Status != FFMS_CHECKPOINT_RUNNING)
+        LastCheckpointWriteNs = Now;
+
+    robust::CheckpointRecord Record;
+    Record.Kind = FFMS_CHECKPOINT_AUDIO;
+    Record.Status = Status;
+    Record.Track = TrackNumber;
+    Record.LastFrame = CompletedPacket;
+    Record.Source = SourceFile;
+    Record.SourceSize = SourceSize;
+    Record.Reason = Reason;
+    Record.UpdatedAtUnixMs = robust::UnixNowMs();
+    if (CompletedPacket >= 0 && static_cast<size_t>(CompletedPacket) < Frames.size()) {
+        const FrameInfo &Info = Frames[CompletedPacket];
+        Record.LastPTS = Info.PTS;
+        Record.LastTimestampMs = av_rescale(Info.PTS, Frames.TB.Num, Frames.TB.Den);
+        Record.LastFilePosition = Info.FilePos;
+    }
+    std::ostringstream Body;
+    Body << "[audio]\n"
+         << "last_completed_packet=" << CompletedPacket << "\n"
+         << "last_completed_sample=" << CompletedSamples << "\n";
+    Record.Body = Body.str();
+
+    std::string IgnoredError;
+    robust::WriteCheckpoint(RobustOptions.CheckpointFile, Record, &IgnoredError);
 }
 

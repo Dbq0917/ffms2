@@ -126,6 +126,12 @@ struct FFMS_AudioSource {
     FFMS_Track Frames;
     AVCodecContext *CodecContext = nullptr;
     FFMS_AudioProperties AP = {};
+    robust::Settings RobustOptions;
+    std::unique_ptr<robust::StallMonitor> Monitor;
+    int64_t LastCheckpointWriteNs = 0;
+    int64_t CompletedPacket = -1;
+    int64_t CompletedSamples = 0;
+    int64_t SourceSize = 0;
 
     int DecodeNextBlock(CacheIterator *cachePos = 0);
     // Initialization which has to be done after the codec is opened
@@ -134,8 +140,11 @@ struct FFMS_AudioSource {
     int64_t FrameTS(size_t Packet) const;
 
     void Free();
+    void WriteCheckpoint(int Status, const std::string &Reason);
 public:
     FFMS_AudioSource(const char *SourceFile, FFMS_Index &Index, int Track, int DelayMode, int FillGaps, double DrcScale);
+    FFMS_AudioSource(const char *SourceFile, FFMS_Index &Index, int Track, int DelayMode, int FillGaps,
+        double DrcScale, const FFMS_RobustOptions *Options);
     ~FFMS_AudioSource();
     FFMS_Track *GetTrack() { return &Frames; }
     const FFMS_AudioProperties& GetAudioProperties() const { return AP; }

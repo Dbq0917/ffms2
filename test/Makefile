@@ -123,3 +123,17 @@ display_matrix: display_matrix.o gtest_main.a ../src/core/libffms2.la
 
 display_matrix-run:
 	@./display_matrix
+
+robust.o: $(USER_DIR)/test/robust.cpp $(USER_DIR)/include/ffms.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $(USER_DIR)/test/robust.cpp
+
+robust: robust.o ../src/core/libffms2.la
+	../libtool --tag=CXX --mode=link $(CXX) $(CPPFLAGS) $(CXXFLAGS) -o robust robust.o -lavutil ../src/core/libffms2.la
+
+robust-run: robust
+	@if test -n "$(ROBUST_TEST_FILE)"; then \
+		./robust "$(ROBUST_TEST_FILE)"; \
+	else \
+		echo "Set ROBUST_TEST_FILE to a media file to run the long-input acceptance test."; \
+		exit 1; \
+	fi

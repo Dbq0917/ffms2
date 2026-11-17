@@ -22,6 +22,7 @@
 #define INDEXING_H
 
 #include "utils.h"
+#include "robust.h"
 
 #include <set>
 #include <map>
@@ -48,7 +49,8 @@ struct FFMS_Index : public std::vector<FFMS_Track> {
     void ReadIndex(ZipFile &zf, const char* IndexFile);
     void WriteIndex(ZipFile &zf);
 public:
-    static void CalculateFileSignature(const char *Filename, int64_t *Filesize, uint8_t Digest[20]);
+    static void CalculateFileSignature(const char *Filename, int64_t *Filesize, uint8_t Digest[20],
+        robust::StallMonitor *Monitor = nullptr);
 
     int ErrorHandling;
     int64_t Filesize;
@@ -56,7 +58,7 @@ public:
     std::map<std::string, std::string> LAVFOpts;
 
     void Finalize(std::vector<SharedAVContext> const& video_contexts, const char *Format);
-    bool CompareFileSignature(const char *Filename);
+    bool CompareFileSignature(const char *Filename, robust::StallMonitor *Monitor = nullptr);
     void WriteIndexFile(const char *IndexFile);
     uint8_t *WriteIndexBuffer(size_t *Size);
 
@@ -78,6 +80,20 @@ private:
     void *ICPrivate = nullptr;
     std::string SourceFile;
     AVFrame *DecodeFrame = nullptr;
+    robust::Settings RobustOptions;
+    std::unique_ptr<robust::StallMonitor> Monitor;
+    int64_t LastCheckpointWriteNs = 0;
+    int64_t LastFrame = -1;
+    int64_t LastPTS = AV_NOPTS_VALUE;
+    int64_t LastTimestampMs = -1;
+    int64_t LastFilePosition = -1;
+    int LastVideoTrack = -1;
+    int64_t LastPacketPos = -1;
+    int64_t LastPacketPTS = AV_NOPTS_VALUE;
+    int64_t LastPacketDTS = AV_NOPTS_VALUE;
+    int LastPacketStream = -1;
+    int LastPacketFlags = 0;
+    int64_t ResumedFromFrame = -1;
 
     int64_t Filesize;
     uint8_t Digest[20];
@@ -87,8 +103,16 @@ private:
     uint32_t IndexAudioPacket(int Track, const AVPacket &Packet, SharedAVContext &Context, FFMS_Index &TrackIndices);
     void ParseVideoPacket(SharedAVContext &VideoContext, const AVPacket &pkt, int *RepeatPict, int *FrameType, bool *Invisible, bool *SecondField, enum AVPictureStructure *LastPicStruct);
     void Free();
+    int TryRestoreCheckpoint(FFMS_Index &TrackIndices, std::vector<SharedAVContext> &AVContexts,
+        std::vector<int64_t> &LastValidTS, enum AVPictureStructure &LastPicStruct);
+    void WriteCheckpoint(const FFMS_Index &TrackIndices, int Status, const std::string &Reason,
+        bool Finalized, const std::vector<SharedAVContext> &AVContexts,
+        const std::vector<int64_t> &LastValidTS,
+        enum AVPictureStructure LastPicStruct);
 public:
     FFMS_Indexer(const char *Filename, const FFMS_KeyValuePair *DemuxerOptions, int NumOptions);
+    FFMS_Indexer(const char *Filename, const FFMS_KeyValuePair *DemuxerOptions, int NumOptions,
+        const FFMS_RobustOptions *Options);
     ~FFMS_Indexer();
 
     void SetIndexTrack(int Track, bool Index);

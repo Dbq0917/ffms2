@@ -128,7 +128,9 @@ typedef enum FFMS_Errors {
     FFMS_ERROR_CODEC,				// decoder error
     FFMS_ERROR_NOT_AVAILABLE,		// requested mode or operation unavailable in this binary
     FFMS_ERROR_FILE_MISMATCH,		// provided index does not match the file
-    FFMS_ERROR_USER					// problem exists between keyboard and chair
+    FFMS_ERROR_USER,				// problem exists between keyboard and chair
+    FFMS_ERROR_STALLED,				// no progress while waiting for I/O or decoding
+    FFMS_ERROR_CHECKPOINT			// checkpoint cannot be read, written, or resumed
 } FFMS_Errors;
 
 typedef enum FFMS_SeekMode {
@@ -430,6 +432,87 @@ typedef struct FFMS_KeyValuePair {
 
 typedef int (FFMS_CC *TIndexCallback)(int64_t Current, int64_t Total, void *ICPrivate);
 
+typedef enum FFMS_ActivityPhase {
+    FFMS_ACTIVITY_IDLE = 0,
+    FFMS_ACTIVITY_OPENING,
+    FFMS_ACTIVITY_READING,
+    FFMS_ACTIVITY_DECODING,
+    FFMS_ACTIVITY_SEEKING,
+    FFMS_ACTIVITY_FINALIZING
+} FFMS_ActivityPhase;
+
+/*
+ * Information describing a no-progress stall. Frame is the most recently
+ * completed frame, not the frame that could not be completed. LastFilePosition
+ * is a byte offset that can be used for diagnostics. Detail is only valid for
+ * the duration of the callback.
+ */
+typedef struct FFMS_StallInfo {
+    int Phase;
+    int Track;
+    int64_t Frame;
+    int64_t PTS;
+    int64_t TimestampMs;
+    int64_t FilePosition;
+    int64_t NoProgressMs;
+    const char *Detail;
+} FFMS_StallInfo;
+
+typedef void (FFMS_CC *TStallCallback)(const FFMS_StallInfo *Info, void *Private);
+
+typedef enum FFMS_CheckpointKind {
+    FFMS_CHECKPOINT_UNKNOWN = 0,
+    FFMS_CHECKPOINT_INDEX = 1,
+    FFMS_CHECKPOINT_DECODE = 2,
+    FFMS_CHECKPOINT_AUDIO = 3
+} FFMS_CheckpointKind;
+
+typedef enum FFMS_CheckpointStatus {
+    FFMS_CHECKPOINT_RUNNING = 0,
+    FFMS_CHECKPOINT_FAILED = 1,
+    FFMS_CHECKPOINT_STALLED = 2,
+    FFMS_CHECKPOINT_CANCELLED = 3,
+    FFMS_CHECKPOINT_COMPLETED = 4
+} FFMS_CheckpointStatus;
+
+typedef struct FFMS_CheckpointInfo {
+    int Version;
+    int Kind;
+    int Status;
+    int Finalized;
+    int Track;
+    int64_t LastFrame;
+    int64_t LastPTS;
+    int64_t LastTimestampMs;
+    int64_t LastFilePosition;
+    int64_t SourceSize;
+    int64_t UpdatedAtUnixMs;
+    char Reason[256];
+} FFMS_CheckpointInfo;
+
+/*
+ * Opt-in reliability features. A zeroed struct disables both features and is
+ * therefore the same as using the legacy entry points. Per-task switches are
+ * EnableStallDetection and EnableCheckpoint; both can be turned off
+ * independently for a single file.
+ *
+ * CheckpointFile and ReportFile are optional. When NULL, a sidecar next to the
+ * source is used. Checkpoints are deliberately plain UTF-8 text and always
+ * carry a "# FFMS2 checkpoint" header so they cannot be mistaken for media or
+ * ffindex output.
+ */
+typedef struct FFMS_RobustOptions {
+    int EnableStallDetection;
+    int64_t StallTimeoutMs;        /* <=0: 30000 ms */
+    int EnableCheckpoint;
+    int64_t CheckpointIntervalMs;  /* <=0: 30000 ms */
+    const char *CheckpointFile;
+    const char *ReportFile;
+    TStallCallback StallCallback;
+    void *StallPrivate;
+    void *Reserved[8];
+} FFMS_RobustOptions;
+
 /* Most functions return 0 on success */
 /* Functions without error message output can be assumed to never fail in a graceful way */
 FFMS_API(void) FFMS_Init(int, int); /* Pass 0 to both arguments, kept to partially preserve abi */
@@ -485,4 +568,27 @@ FFMS_API(int) FFMS_WriteIndex(const char *IndexFile, FFMS_Index *Index, FFMS_Err
 FFMS_API(int) FFMS_WriteIndexToBuffer(uint8_t **BufferPtr, size_t *Size, FFMS_Index *Index, FFMS_ErrorInfo *ErrorInfo);
 FFMS_API(void) FFMS_FreeIndexBuffer(uint8_t **BufferPtr);
 FFMS_API(int) FFMS_GetPixFmt(const char *Name);
+
+/*
+ * Reliability-enabled constructors. They are source-compatible with the
+ * existing constructors and do not alter their behavior. Passing NULL options
+ * is equivalent to the legacy call.
+ */
+FFMS_API(FFMS_Indexer *) FFMS_CreateIndexerWithOptions(const char *SourceFile,
+    const FFMS_KeyValuePair *DemuxerOptions, int NumOptions,
+    const FFMS_RobustOptions *Options, FFMS_ErrorInfo *ErrorInfo);
+FFMS_API(FFMS_VideoSource *) FFMS_CreateVideoSourceWithOptions(const char *SourceFile,
+    int Track, FFMS_Index *Index, int Threads, int SeekMode,
+    const FFMS_RobustOptions *Options, FFMS_ErrorInfo *ErrorInfo);
+FFMS_API(FFMS_AudioSource *) FFMS_CreateAudioSourceWithOptions(const char *SourceFile,
+    int Track, FFMS_Index *Index, int DelayMode, int FillGaps, double DrcScale,
+    const FFMS_RobustOptions *Options, FFMS_ErrorInfo *ErrorInfo);
+
+/* Reads the last durable progress record. Use LastFrame + 1 to resume. */
+FFMS_API(int) FFMS_ReadCheckpoint(const char *CheckpointFile,
+    FFMS_CheckpointInfo *Info, FFMS_ErrorInfo *ErrorInfo);
+
+/* Returns the default sidecar checkpoint name for a source. Free with FFMS_FreeString. */
+FFMS_API(char *) FFMS_GetCheckpointFileName(const char *SourceFile, int Kind);
+FFMS_API(void) FFMS_FreeString(char *String);
 #endif

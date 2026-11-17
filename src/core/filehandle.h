@@ -24,6 +24,7 @@
 #include <string>
 
 struct AVIOContext;
+struct AVIOInterruptCB;
 
 class FileHandle {
     AVIOContext *avio;
@@ -32,7 +33,8 @@ class FileHandle {
     int error_cause;
 
 public:
-    FileHandle(const char *filename, const char *mode, int error_source, int error_cause);
+    FileHandle(const char *filename, const char *mode, int error_source, int error_cause,
+        const AVIOInterruptCB *InterruptCallback = nullptr);
     FileHandle() : avio(nullptr) {}
     ~FileHandle();
 
